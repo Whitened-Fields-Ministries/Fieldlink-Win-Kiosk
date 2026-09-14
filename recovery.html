@@ -133,7 +133,7 @@
       <div id="server-field" class="field hidden">
         <label for="server">FieldLink server</label>
         <div style="display:flex;gap:8px">
-          <input id="server" type="text" placeholder="https://fieldlinkmissions.com" autocomplete="off" spellcheck="false" style="flex:1">
+          <input id="server" type="text" placeholder="https://app.fieldlinkmissions.com" autocomplete="off" spellcheck="false" style="flex:1">
           <button id="server-btn">Use this server</button>
         </div>
         <div class="sub" style="margin-top:6px">Only change this if your church uses a different FieldLink address.</div>
@@ -152,7 +152,7 @@
       <div class="field">
         <label for="url">Kiosk URL or key (from ⚙ Settings → Copy URL)</label>
         <div style="display:flex;gap:8px;align-items:center">
-          <input id="url" type="text" placeholder="https://fieldlinkmissions.com/kiosk?key=fl_kiosk_…" autocomplete="off" spellcheck="false" style="flex:1">
+          <input id="url" type="text" placeholder="https://app.fieldlinkmissions.com/kiosk?key=fl_kiosk_…" autocomplete="off" spellcheck="false" style="flex:1">
           <button id="url-btn">Use</button>
         </div>
         <div id="url-msg" class="msg"></div>
@@ -224,6 +224,7 @@
   const $ = id => document.getElementById(id);
   const bridge = window.kiosk;
   let state = null;
+  let serverRevealed = false;
   let admin = null;          // last adminStatus()
   let tick = null;
   let resultPoll = null;
@@ -239,7 +240,9 @@
     document.querySelectorAll('.reason').forEach(el => el.classList.toggle('hidden', el.id !== 'r-' + reason));
     const pairing = reason === 'invalid-key' || reason === 'no-config' || reason === 'manual';
     $('pair-display').classList.toggle('hidden', !pairing);
-    $('server-field').classList.toggle('hidden', !(reason === 'no-config' || reason === 'manual'));
+    // The server field is for staff only (a QA display, a self-hosted FieldLink):
+    // it stays hidden until Ctrl+Shift+S is pressed on this screen.
+    $('server-field').classList.toggle('hidden', !(serverRevealed && (reason === 'no-config' || reason === 'manual')));
     $('alt').open = false;
     $('back-btn').classList.toggle('hidden', !(state && state.hasConfig && (reason === 'manual' || reason === 'invalid-key')));
   }
@@ -251,7 +254,7 @@
     if (p.status === 'error') { codeEl.textContent = '—'; codeEl.className = 'bigcode dim'; sub.textContent = p.error || 'Could not get a code.'; return; }
     codeEl.textContent = p.code; codeEl.className = 'bigcode';
     const secs = Math.max(0, Math.round((p.expiresAt - Date.now()) / 1000));
-    sub.innerHTML = 'Waiting for FieldLink Admin… <span class="countdown">code renews in ' + mmss(secs) + '</span>' + (p.origin && p.origin !== 'https://fieldlinkmissions.com' ? ' · server ' + p.origin : '');
+    sub.innerHTML = 'Waiting for FieldLink Admin… <span class="countdown">code renews in ' + mmss(secs) + '</span>' + (p.origin && state && p.origin !== state.defaultServer ? ' · server ' + p.origin : '');
   }
 
   function render(s) {
@@ -451,6 +454,14 @@
     else if (r.upToDate) { setBusy(false); say('update-msg', 'Already up to date.', 'ok'); refreshUpdate(); }
   });
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && state && state.hasConfig && state.reason === 'manual') bridge && bridge.back(); });
+  // Ctrl+Shift+S reveals the server field (type qa, prod or a full address, then "Use this server").
+  document.addEventListener('keydown', e => {
+    if (!(e.ctrlKey && e.shiftKey && e.code === 'KeyS')) return;
+    e.preventDefault();
+    serverRevealed = !serverRevealed;
+    if (state) render(state);
+    if (serverRevealed && !$('server-field').classList.contains('hidden')) { $('server').focus(); $('server').select(); }
+  });
 
   if (bridge) {
     bridge.onState(render);
@@ -461,7 +472,7 @@
     bridge.adminJob().then(j => { if (j) { renderJob(j); if (j.running) { setBusy(true); watchJob(); } } });
   } else {
     // Opened outside the app (e.g. in a browser while developing).
-    render({ reason: new URLSearchParams(location.search).get('reason') || 'no-config', hasConfig: false, defaultServer: 'https://fieldlinkmissions.com', configTargets: ['(not running inside the kiosk app)'], pair: { status: 'waiting', code: 'K7M-3PX', expiresAt: Date.now() + 14 * 60 * 1000, origin: 'https://fieldlinkmissions.com' } });
+    render({ reason: new URLSearchParams(location.search).get('reason') || 'no-config', hasConfig: false, defaultServer: 'https://app.fieldlinkmissions.com', configTargets: ['(not running inside the kiosk app)'], pair: { status: 'waiting', code: 'K7M-3PX', expiresAt: Date.now() + 14 * 60 * 1000, origin: 'https://app.fieldlinkmissions.com' } });
     renderAdmin({ lockedDown: false, accountExists: false, updater: { installed: false } });
     renderUpdate({ installed: '1.2.0', latest: '1.2.0', newer: false });
   }

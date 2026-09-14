@@ -134,12 +134,25 @@ function Read-Json([string]$path) {
   try { if (Test-Path $path) { return (Get-Content $path -Raw -Encoding UTF8 | ConvertFrom-Json) } } catch {}
   return $null
 }
+# Servers recorded before the app moved to its app. host keep working: same key,
+# new origin (the app migrates config.json the same way).
+$LegacyServers = @{
+  'https://fieldlinkmissions.com'     = 'https://app.fieldlinkmissions.com'
+  'https://www.fieldlinkmissions.com' = 'https://app.fieldlinkmissions.com'
+  'https://qa.fieldlinkmissions.com'  = 'https://app.qa.fieldlinkmissions.com'
+}
+function Resolve-Server([string]$s) {
+  if (-not $s) { return $s }
+  $k = $s.TrimEnd('/').ToLowerInvariant()
+  if ($LegacyServers.ContainsKey($k)) { return $LegacyServers[$k] }
+  return $s
+}
 function Get-ConfiguredServer {
-  if ($Server) { return $Server }
+  if ($Server) { return (Resolve-Server $Server) }
   $u = Read-Json $UpdateCfg
-  if ($u -and $u.server) { return [string]$u.server }
+  if ($u -and $u.server) { return (Resolve-Server ([string]$u.server)) }
   $c = Read-Json (Join-Path $DataDir 'config.json')
-  if ($c -and $c.kioskUrl) { try { return ([Uri]$c.kioskUrl).GetLeftPart([UriPartial]::Authority) } catch {} }
+  if ($c -and $c.kioskUrl) { try { return (Resolve-Server ([Uri]$c.kioskUrl).GetLeftPart([UriPartial]::Authority)) } catch {} }
   return $null
 }
 function Test-ProfileExists {

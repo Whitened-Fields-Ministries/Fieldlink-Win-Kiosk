@@ -27,7 +27,21 @@ const os   = require('os');
 const { execFile } = require('child_process');
 
 const APP_VERSION        = app.getVersion();
-const DEFAULT_SERVER     = 'https://fieldlinkmissions.com';
+// The FieldLink app lives on the app. host; the bare domain is the public website.
+const DEFAULT_SERVER     = 'https://app.fieldlinkmissions.com';
+// Short names accepted wherever a server can be typed (setup screen, pasted key):
+// "qa" points a display at the QA stack without spelling out its hostname.
+const SERVER_ALIASES     = {
+  prod: DEFAULT_SERVER, production: DEFAULT_SERVER, live: DEFAULT_SERVER,
+  qa: 'https://app.qa.fieldlinkmissions.com', test: 'https://app.qa.fieldlinkmissions.com',
+};
+// Origins a config.json may still carry from before the app moved to app.*:
+// migrated in place (same key) the first time the app starts after updating.
+const LEGACY_ORIGINS     = {
+  'https://fieldlinkmissions.com':     DEFAULT_SERVER,
+  'https://www.fieldlinkmissions.com': DEFAULT_SERVER,
+  'https://qa.fieldlinkmissions.com':  SERVER_ALIASES.qa,
+};
 const HEALTH_INTERVAL_MS = 30 * 1000;          // steady-state key/server check
 const RETRY_STEPS_MS     = [5000, 10000, 20000, 30000]; // backoff while offline
 const REQUEST_TIMEOUT_MS = 15 * 1000;
@@ -139,12 +153,15 @@ function normaliseKioskInput(text, fallbackOrigin) {
   if (!parsed) throw new Error('That is not a valid web address.');
   if (!parsed.key) throw new Error('That address has no ?key=… part. Copy the full kiosk URL from FieldLink Admin → Kiosk.');
   if (!KEY_RE.test(parsed.key)) throw new Error('The key in that address does not look like a FieldLink kiosk key.');
-  return parsed.url;
+  const moved = LEGACY_ORIGINS[parsed.origin];
+  return moved ? `${moved}/kiosk?key=${parsed.key}` : parsed.url;
 }
 
 function normaliseOrigin(text) {
   const t = String(text || '').trim();
   if (!t) return DEFAULT_SERVER;
+  const alias = SERVER_ALIASES[t.toLowerCase()];
+  if (alias) return alias;
   const withScheme = /^https?:\/\//i.test(t) ? t : `https://${t}`;
   const u = new URL(withScheme);
   if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('Server must be an http(s) address.');
@@ -227,11 +244,23 @@ function pushState() {
   }
 }
 
+// A kiosk URL saved before the app moved to the app.* host keeps its key and gets
+// the new origin. Returns the URL to use (unchanged when nothing is legacy).
+function migrateLegacyOrigin(parsed) {
+  const target = parsed && LEGACY_ORIGINS[parsed.origin];
+  if (!target) return parsed ? parsed.url : null;
+  const migrated = `${target}/kiosk?key=${parsed.key}`;
+  log(`config: server moved ${parsed.origin} → ${target} (same key)`);
+  try { saveConfig({ kioskUrl: migrated }); }
+  catch (e) { log(`config: could not save the moved server, using it for this run only: ${e.message}`); }
+  return migrated;
+}
+
 function applyConfig() {
   const { config, source } = loadConfig();
   configSource = source;
   const parsed = config && config.kioskUrl ? parseKioskUrl(config.kioskUrl) : null;
-  kioskUrl = parsed ? parsed.url : null;
+  kioskUrl = parsed ? migrateLegacyOrigin(parsed) : null;
   if (config && config.kioskUrl && !parsed) log(`config: kioskUrl is not a valid URL: ${config.kioskUrl}`);
   log(`config: ${kioskUrl ? `using ${source}` : 'no usable config found'} (candidates: ${configCandidates().join(' | ')})`);
   return !!kioskUrl;

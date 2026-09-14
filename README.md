@@ -55,6 +55,22 @@ Codes renew every 15 minutes by themselves.
 Fallback: pasting a full kiosk URL or key under "Have a kiosk URL?" on the screen (for the rare case
 where the admin panel cannot be reached from a phone).
 
+### Servers
+
+The app talks to `https://app.fieldlinkmissions.com` by default (`DEFAULT_SERVER` in `main.js`): the
+FieldLink application lives on the `app.` host, the bare domain is the public website. A `config.json`
+or `update.json` written before that move (`https://fieldlinkmissions.com`, `https://qa.fieldlinkmissions.com`)
+is migrated on the next start — same key, new origin (`LEGACY_ORIGINS` in `main.js`, `$LegacyServers` in the
+helper) — so nothing needs re-linking after the update. The server also answers those old addresses with a
+redirect, which is how a display still on an older build finds this update.
+
+Pointing a display at another server (QA, a self-hosted FieldLink) is deliberately not offered on the
+screen. On the Ctrl+Shift+K screen press **Ctrl+Shift+S** and a *FieldLink server* field appears: type
+`qa` (short for `https://app.qa.fieldlinkmissions.com`), `prod`, or a full address and click **Use this
+server**; the link code is then requested from that server and the kiosk URL it hands back keeps it.
+Pasting a full kiosk URL copied from that server's Admin → Kiosk page under "Have a kiosk URL?" does the
+same without the field. *Details* on the same screen shows the server in use.
+
 ### Privileged helper (`resources/kiosk-admin.ps1`)
 
 Invoked by `main.js` through `Start-Process -Verb RunAs` (one UAC prompt). It reports progress by rewriting
@@ -115,6 +131,7 @@ Only `kioskUrl` matters. Display mode, theme, carousel and the rest live on the 
 | Keys | Action |
 |------|--------|
 | Ctrl+Shift+K | Open / close the settings & recovery screen |
+| Ctrl+Shift+S | On that screen: show / hide the *FieldLink server* field (`qa`, `prod` or an address) |
 | Ctrl+Shift+R | Reload the kiosk page |
 | Ctrl+Shift+Q | Quit the app |
 
@@ -136,7 +153,8 @@ so **test `kiosk-admin.ps1` on a real PC** before releasing changes to it: `Lock
 ## Release
 
 Every push to `main` runs [`build.yml`](.github/workflows/build.yml): Windows runner, installer attached to the
-GitHub release tagged **`latest`**, then `POST /api/kiosk/installer/invalidate` on the FieldLink server so its
+GitHub release tagged **`latest`**, then `POST /api/kiosk/installer/invalidate` on the FieldLink server
+(`FIELDLINK_SERVER_URL` secret — the app host, `https://app.fieldlinkmissions.com`) so its
 cached copy is replaced immediately. Bump `version` in `package.json` with every behaviour change: the
 updater compares it, the screen shows it, and requests carry a `FieldLinkKiosk/<version>` user-agent suffix.
 

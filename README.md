@@ -131,9 +131,16 @@ Only `kioskUrl` matters. Display mode, theme, carousel and the rest live on the 
 | Keys | Action |
 |------|--------|
 | Ctrl+Shift+K | Open / close the settings & recovery screen |
+| Press and hold the top-left corner for 4 s | The same, without a keyboard — touch or mouse |
 | Ctrl+Shift+S | On that screen: show / hide the *FieldLink server* field (`qa`, `prod` or an address) |
 | Ctrl+Shift+R | Reload the kiosk page |
 | Ctrl+Shift+Q | Quit the app |
+
+**Getting to the settings screen without a keyboard.** Press and hold the top-left corner of the
+screen for four seconds with one finger (touch screen) or the mouse. A small progress ring shows
+while holding; the settings screen opens, and the same gesture closes it. It is detected in
+`preload.js` on every page the window shows, including the kiosk page, and only ever does what
+Ctrl+Shift+K does (the same snippet as `app/preload.js` in Fieldlink-Pi-Kiosk).
 
 Logs: `%APPDATA%\fieldlink-kiosk\kiosk.log` (app, per user) and `%ProgramData%\FieldLinkKiosk-Admin\admin.log`
 (helper). Both paths are shown on the Ctrl+Shift+K screen.

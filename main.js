@@ -15,7 +15,9 @@
 //   %APPDATA%\<app>\config.json                 fallback when ProgramData is read-only
 //   ./config.json                               development only (npm start)
 //
-// Keyboard (a keyboard must be plugged into the kiosk PC):
+// Keyboard (a keyboard plugged into the kiosk PC) — or, with no keyboard, press
+// and hold the top-left corner of the screen for four seconds (touch or mouse)
+// to open and close the settings screen:
 //   Ctrl+Shift+K  open the settings / recovery screen
 //   Ctrl+Shift+R  reload the kiosk page
 //   Ctrl+Shift+Q  quit the app
@@ -837,6 +839,20 @@ ipcMain.handle('kiosk:admin-run', (_e, { action } = {}) => adminRunElevated(acti
 ipcMain.handle('kiosk:admin-result', () => readAdminResult());
 ipcMain.handle('kiosk:admin-job', () => adminJobSnapshot());
 ipcMain.handle('kiosk:check-update', () => checkUpdate());
+// ── The settings screen: Ctrl+Shift+K and the corner-hold gesture ────────────
+// The gesture itself is detected in preload.js (it needs the page's pointer
+// events); it only ever asks for the same thing Ctrl+Shift+K does.
+function toggleSettingsScreen(source) {
+  log(`settings screen toggled (${source})`);
+  if (view === 'recovery' && recoveryReason === 'manual') { if (kioskUrl) showKiosk(); }
+  else showRecovery('manual');
+}
+ipcMain.on('kiosk:gesture', (e, { name } = {}) => {
+  if (!win || win.isDestroyed() || e.sender !== win.webContents) return;
+  if (name !== 'corner-hold') return;
+  toggleSettingsScreen('corner hold');
+});
+
 ipcMain.handle('kiosk:restart', () => {
   if (process.platform !== 'win32') return { ok: false, error: 'Windows only.' };
   log('restart requested from the settings screen');
@@ -924,10 +940,7 @@ app.whenReady().then(() => {
   if (kioskUrl) showKiosk(); else showRecovery('no-config');
   scheduleCheck(kioskUrl ? 5000 : HEALTH_INTERVAL_MS);
 
-  globalShortcut.register('CommandOrControl+Shift+K', () => {
-    if (view === 'recovery' && recoveryReason === 'manual') { if (kioskUrl) showKiosk(); }
-    else showRecovery('manual');
-  });
+  globalShortcut.register('CommandOrControl+Shift+K', () => toggleSettingsScreen('Ctrl+Shift+K'));
   globalShortcut.register('CommandOrControl+Shift+R', () => {
     if (kioskUrl) { invalidStreak = 0; showKiosk(); scheduleCheck(5000); }
   });

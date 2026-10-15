@@ -44,6 +44,11 @@ const LEGACY_ORIGINS     = {
   'https://www.fieldlinkmissions.com': DEFAULT_SERVER,
   'https://qa.fieldlinkmissions.com':  SERVER_ALIASES.qa,
 };
+// The servers whose installer builds this app will install. A display can be
+// pointed at another FieldLink server (QA, self-hosted) for its map, but code
+// only ever comes from here: every installer is the same GitHub build, and a
+// server chosen on the kiosk screen must never be able to hand this PC an exe.
+const TRUSTED_ORIGINS    = new Set([DEFAULT_SERVER, SERVER_ALIASES.qa]);
 const HEALTH_INTERVAL_MS = 30 * 1000;          // steady-state key/server check
 const RETRY_STEPS_MS     = [5000, 10000, 20000, 30000]; // backoff while offline
 const REQUEST_TIMEOUT_MS = 15 * 1000;
@@ -134,12 +139,29 @@ function saveConfig(patch) {
   throw new Error(`Could not save config anywhere (${lastErr ? lastErr.message : 'unknown error'})`);
 }
 
+// The kiosk key travels in a header and in the page URL, so the server must be
+// reached over TLS; plain http is only for a developer's own machine.
+function allowedProtocol(u) {
+  if (u.protocol === 'https:') return true;
+  return u.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(u.hostname);
+}
+
 function parseKioskUrl(kioskUrl) {
   try {
     const u = new URL(kioskUrl);
-    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    if (!allowedProtocol(u)) return null;
     return { url: u.toString(), origin: u.origin, key: u.searchParams.get('key') || '' };
   } catch { return null; }
+}
+
+// Origins this display may be linked to from its own screen: the FieldLink
+// servers, the server it is already on, and the one typed into the staff-only
+// server field (which is what starts a pairing request there).
+function originAllowed(origin) {
+  if (TRUSTED_ORIGINS.has(origin)) return true;
+  const current = kioskUrl ? parseKioskUrl(kioskUrl) : null;
+  if (current && current.origin === origin) return true;
+  return !!(pair && pair.origin === origin);
 }
 
 // Accepts a full kiosk URL or a bare key; returns a normalised kiosk URL.
@@ -152,11 +174,11 @@ function normaliseKioskInput(text, fallbackOrigin) {
   }
   const withScheme = /^https?:\/\//i.test(t) ? t : `https://${t}`;
   const parsed = parseKioskUrl(withScheme);
-  if (!parsed) throw new Error('That is not a valid web address.');
+  if (!parsed) throw new Error('That is not a valid web address (the server must use https).');
   if (!parsed.key) throw new Error('That address has no ?key=… part. Copy the full kiosk URL from FieldLink Admin → Kiosk.');
   if (!KEY_RE.test(parsed.key)) throw new Error('The key in that address does not look like a FieldLink kiosk key.');
   const moved = LEGACY_ORIGINS[parsed.origin];
-  return moved ? `${moved}/kiosk?key=${parsed.key}` : parsed.url;
+  return moved ? `${moved}/kiosk?key=${parsed.key}` : `${parsed.origin}/kiosk?key=${parsed.key}`;
 }
 
 function normaliseOrigin(text) {
@@ -166,8 +188,15 @@ function normaliseOrigin(text) {
   if (alias) return alias;
   const withScheme = /^https?:\/\//i.test(t) ? t : `https://${t}`;
   const u = new URL(withScheme);
-  if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new Error('Server must be an http(s) address.');
+  if (!allowedProtocol(u)) throw new Error('Server must be an https address.');
   return u.origin;
+}
+
+// Where installer builds come from (see TRUSTED_ORIGINS).
+function updateOrigin() {
+  const p = kioskUrl ? parseKioskUrl(kioskUrl) : null;
+  const origin = (pair && pair.origin) || (p && p.origin) || DEFAULT_SERVER;
+  return TRUSTED_ORIGINS.has(origin) ? origin : DEFAULT_SERVER;
 }
 
 // ── Server health / key validity ─────────────────────────────────────────────
@@ -419,6 +448,8 @@ ipcMain.handle('kiosk:set-url', async (_e, { text, server } = {}) => {
   try {
     const current = kioskUrl ? parseKioskUrl(kioskUrl) : null;
     const url = normaliseKioskInput(text, server || (current && current.origin));
+    const origin = parseKioskUrl(url).origin;
+    if (!originAllowed(origin)) return { ok: false, error: `${origin} is not a FieldLink server this display knows. To use another server, press Ctrl+Shift+S, enter it in the FieldLink server field and click "Use this server" first.` };
     const check = await checkKey(url);
     if (check.status === 'invalid') return { ok: false, error: 'The server rejected that key. Copy the URL again from FieldLink Admin → Kiosk → ⚙ Settings → Copy URL.' };
     // Offline/server errors: save anyway — the health loop will bring the page up when the server is reachable.
@@ -513,8 +544,9 @@ async function pollPairRequest() {
     if (pair !== p) return;
     if (r.ok && r.body && r.body.status === 'linked' && r.body.url) {
       const parsed = parseKioskUrl(r.body.url);
-      if (parsed && parsed.key) {
-        const saved = saveConfig({ kioskUrl: parsed.url });
+      // The server we asked may only link us to itself (a legacy host moves to its app. host).
+      if (parsed && parsed.key && KEY_RE.test(parsed.key) && (parsed.origin === p.origin || LEGACY_ORIGINS[parsed.origin] === p.origin)) {
+        const saved = saveConfig({ kioskUrl: `${p.origin}/kiosk?key=${parsed.key}` });
         keyInfo = r.body.key || null; kioskUrl = parsed.url; configSource = saved; invalidStreak = 0;
         log(`pair-request: linked as "${(r.body.key && r.body.key.name) || '?'}" — saved to ${saved}`);
         stopPairRequest();
@@ -597,12 +629,6 @@ function readAdminResult() {
 
 let adminJob = null; // { action, startedAt, finishedAt, running, exitCode, logFile, error }
 
-function adminTempDir() {
-  const d = path.join(app.getPath('temp'), 'FieldLinkKiosk-admin');
-  fs.mkdirSync(d, { recursive: true });
-  return d;
-}
-
 function tailFile(file, maxLines) {
   try {
     const buf = fs.readFileSync(file);
@@ -614,38 +640,38 @@ function tailFile(file, maxLines) {
 }
 
 // Runs kiosk-admin.ps1 elevated (one UAC prompt) and WAITS for it, so we know
-// exactly when it finished and how. Everything the helper prints goes to a
-// log file in this user's temp folder that the screen tails live.
+// exactly when it finished and how.
+//
+// The elevated process runs the helper straight from the install directory
+// (Program Files, writable by administrators only) and nothing else: no wrapper
+// script and no file from this user's profile is ever executed with the admin
+// token, so a process running as the (standard) kiosk account cannot swap in
+// code of its own between the UAC prompt and the run. The helper writes a
+// per-run log into %ProgramData%\FieldLinkKiosk-Admin\runs (admins write,
+// everyone reads), which the screen tails live.
 async function adminRunElevated(action) {
   const allowed = ['Lockdown', 'Unlock', 'Update', 'InstallUpdater', 'RemoveUpdater'];
   if (!allowed.includes(action)) return { ok: false, error: 'Unknown action.' };
   if (process.platform !== 'win32') return { ok: false, error: 'Kiosk mode is only available on Windows.' };
   if (adminJob && adminJob.running) return { ok: false, error: `${adminJob.action} is still running.` };
+  const dir = adminDir();
+  if (!dir) return { ok: false, error: 'ProgramData is not available.' };
 
-  const dir = adminTempDir();
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const logFile = path.join(dir, `${action}-${stamp}.log`);
-  const runner  = path.join(dir, `run-${action}.ps1`);
+  const runLog = `${action}-${stamp}.log`;                 // a file name only; the helper keeps it in its own folder
+  const logFile = path.join(dir, 'runs', runLog);
   const q = v => String(v).replace(/'/g, "''");
-  const ps1 = [
-    "$ErrorActionPreference = 'Continue'",
-    `$log = '${q(logFile)}'`,
-    `"[$(Get-Date -Format 'HH:mm:ss')] helper starting: ${action}" | Out-File -FilePath $log -Encoding utf8`,
-    `& '${q(adminScriptPath())}' -Action ${action} -Exe '${q(app.getPath('exe'))}'${action === 'Update' ? ' -Relaunch' : ''} *>&1 | Out-File -FilePath $log -Append -Encoding utf8`,
-    '$code = $LASTEXITCODE',
-    'if ($null -eq $code) { $code = 0 }',
-    `"[$(Get-Date -Format 'HH:mm:ss')] helper exit code $code" | Out-File -FilePath $log -Append -Encoding utf8`,
-    'exit $code',
-    '',
-  ].join('\r\n');
-  fs.writeFileSync(runner, '\ufeff' + ps1, 'utf8');
+  for (const v of [psExe(), adminScriptPath(), app.getPath('exe')]) {
+    if (/["\r\n]/.test(v)) return { ok: false, error: 'Unexpected characters in an installation path.' };
+  }
 
   adminActionStartedAt = Date.now();
   adminJob = { action, startedAt: adminActionStartedAt, finishedAt: null, running: true, exitCode: null, logFile, error: null };
   log(`admin: ${action} requested (UAC prompt) — log ${logFile}`);
   pushState();
 
-  const cmd = `$p = Start-Process -FilePath '${q(psExe())}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${q(runner)}"'; exit $p.ExitCode`;
+  const helperArgs = `-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${adminScriptPath()}" -Action ${action} -Exe "${app.getPath('exe')}" -RunLog "${runLog}"${action === 'Update' ? ' -Relaunch' : ''}`;
+  const cmd = `$p = Start-Process -FilePath '${q(psExe())}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '${q(helperArgs)}'; exit $p.ExitCode`;
   const r = await runPs(['-Command', cmd], 15 * 60 * 1000);
   adminJob.running = false;
   adminJob.finishedAt = Date.now();
@@ -680,8 +706,7 @@ function cmpVersion(a, b) {
 }
 
 async function checkUpdate() {
-  const p = kioskUrl ? parseKioskUrl(kioskUrl) : null;
-  const origin = (pair && pair.origin) || (p && p.origin) || DEFAULT_SERVER;
+  const origin = updateOrigin();
   try {
     const r = await fetchJson(`${origin}/api/kiosk/installer/version`);
     if (!r.ok || !r.body) return { installed: APP_VERSION, server: origin, error: `HTTP ${r.status}` };
@@ -692,93 +717,41 @@ async function checkUpdate() {
   }
 }
 
-// ── In-app update (does not depend on the helper script) ─────────────────────
-// Download the installer ourselves, verify it, then ask Windows once (UAC) to
-// run it silently. The elevated command also relaunches the app afterwards,
-// because the installer closes the running app.
-let updateState = null; // { phase: checking|downloading|verifying|installing|done|failed, percent, message, error, startedAt }
+// ── In-app update from an administrator's session ────────────────────────────
+// The helper's Update action does the whole job inside the elevated process:
+// it downloads into the admin-only folder, checks size and sha256 against the
+// server, installs silently and relaunches the app (-Relaunch). Nothing is
+// downloaded or verified by this unprivileged process and then handed up —
+// a file in this user's profile could be swapped between the check and the
+// install — so there is one UAC prompt and the elevated side trusts only
+// itself and the FieldLink server.
+let updateState = null; // { phase: checking|installing|done|failed, percent, message, error, startedAt }
 
 function setUpdateState(patch) {
   updateState = { ...(updateState || {}), ...patch, updatedAt: Date.now() };
   pushState();
 }
 
-async function installUpdateNative() {
+async function installUpdateElevated() {
   if (process.platform !== 'win32') return { ok: false, error: 'Windows only.' };
-  if (updateState && ['checking', 'downloading', 'verifying', 'installing'].includes(updateState.phase)) return { ok: false, error: 'An update is already in progress.' };
+  if (updateState && ['checking', 'installing'].includes(updateState.phase)) return { ok: false, error: 'An update is already in progress.' };
   setUpdateState({ phase: 'checking', percent: 0, message: 'Checking for a newer build…', error: null, startedAt: Date.now() });
-  try {
-    const u = await checkUpdate();
-    if (u.error) throw new Error(`Could not check ${u.server}: ${u.error}`);
-    if (!u.newer) { setUpdateState({ phase: 'done', percent: 100, message: `Already up to date (FieldLinkKiosk ${APP_VERSION}).` }); return { ok: true, upToDate: true }; }
-    const dir = path.join(app.getPath('temp'), 'FieldLinkKiosk-update');
-    fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, `FieldLinkKiosk-Setup-${u.latest}.exe`);
-    try { fs.unlinkSync(file); } catch {}
-
-    setUpdateState({ phase: 'downloading', percent: 0, message: `Downloading FieldLinkKiosk ${u.latest}…` });
-    log(`update: downloading ${u.latest} from ${u.server}`);
-    const res = await net.fetch(`${u.server}/api/kiosk/installer`, { cache: 'no-store', headers: { 'User-Agent': `FieldLinkKiosk/${APP_VERSION}` } });
-    if (!res.ok || !res.body) throw new Error(`Server answered HTTP ${res.status} for the installer.`);
-    const total = Number(res.headers.get('content-length')) || u.size || 0;
-    const hash = require('crypto').createHash('sha256');
-    let received = 0;
-    await new Promise((resolve, reject) => {
-      const out = fs.createWriteStream(file);
-      const reader = res.body.getReader();
-      out.on('error', reject);
-      (async () => {
-        try {
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            hash.update(value);
-            received += value.length;
-            if (!out.write(Buffer.from(value))) await new Promise(r => out.once('drain', r));
-            if (total) setUpdateState({ percent: Math.min(99, Math.round(received / total * 100)), message: `Downloading FieldLinkKiosk ${u.latest}… ${(received / 1048576).toFixed(0)} / ${(total / 1048576).toFixed(0)} MB` });
-          }
-          out.end(resolve);
-        } catch (e) { reject(e); }
-      })();
-    });
-
-    setUpdateState({ phase: 'verifying', percent: 100, message: 'Verifying download…' });
-    const size = fs.statSync(file).size;
-    if (u.size && Number(u.size) !== size) throw new Error(`Download is ${size} bytes, expected ${u.size}.`);
-    const digest = hash.digest('hex');
-    if (u.sha256 && u.sha256.toLowerCase() !== digest) throw new Error('Download checksum does not match the server.');
-    log(`update: downloaded ${size} bytes, sha256 ${digest.slice(0, 12)}… (server ${u.sha256 ? 'verified' : 'gave no checksum'})`);
-
-    setUpdateState({ phase: 'installing', message: `Installing FieldLinkKiosk ${u.latest}. Windows will ask for permission; the app closes and reopens by itself.` });
-    const exe = app.getPath('exe');
-    // The elevated part is a tiny script file (no nested quoting across the
-    // command line). It runs after the UAC prompt and survives this process
-    // being closed by the installer; explorer.exe relaunches the app de-elevated.
-    const runner = path.join(dir, 'run-update.ps1');
-    const ps1 = [
-      "$ErrorActionPreference = 'Continue'",
-      `Start-Process -FilePath '${file.replace(/'/g, "''")}' -ArgumentList '/S' -Wait`,
-      'Start-Sleep -Seconds 2',
-      `Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList ('"' + '${exe.replace(/'/g, "''")}' + '"')`,
-      '',
-    ].join('\r\n');
-    fs.writeFileSync(runner, '\ufeff' + ps1, 'utf8');
-    const cmd = `Start-Process -FilePath '${psExe()}' -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${runner.replace(/'/g, "''")}"'`;
-    const r = await runPs(['-Command', cmd], 120000);
-    if (r.code !== 0) {
-      const declined = /cancel/i.test(r.stderr) || /1223/.test(r.stderr);
-      throw new Error(declined ? 'Administrator permission was declined.' : (r.stderr.trim().slice(0, 300) || 'Could not start the installer.'));
-    }
-    log(`update: installer ${u.latest} started elevated — expecting to be closed and relaunched`);
-    return { ok: true };
-  } catch (e) {
-    const msg = e && e.message ? e.message : String(e);
-    log(`update: failed — ${msg}`);
-    setUpdateState({ phase: 'failed', message: `Update failed: ${msg}`, error: msg });
+  const u = await checkUpdate();
+  if (u.error) { const msg = `Could not check ${u.server}: ${u.error}`; setUpdateState({ phase: 'failed', message: msg, error: msg }); return { ok: false, error: msg }; }
+  if (!u.newer) { setUpdateState({ phase: 'done', percent: 100, message: `Already up to date (FieldLinkKiosk ${APP_VERSION}).` }); return { ok: true, upToDate: true }; }
+  setUpdateState({ phase: 'installing', message: `Installing FieldLinkKiosk ${u.latest}. Windows asks for administrator permission; the app closes and reopens by itself.` });
+  log(`update: ${u.latest} available from ${u.server} — running the helper elevated`);
+  const r = await adminRunElevated('Update');
+  if (!r.ok) {
+    const result = readAdminResult();
+    const msg = (result && !result.stale && result.action === 'Update' && result.message) || r.error || 'The update did not run.';
+    setUpdateState({ phase: 'failed', message: msg, error: msg });
     return { ok: false, error: msg };
   }
+  // Normally the installer has closed this process before we get here.
+  setUpdateState({ phase: 'done', percent: 100, message: `Updated to FieldLinkKiosk ${u.latest}.` });
+  return { ok: true };
 }
-
 const UPDATE_TASK = 'FieldLinkKiosk Update';
 
 // Start the SYSTEM update task and follow its progress through the result
@@ -818,7 +791,7 @@ async function installUpdateViaTask() {
 
 async function installUpdate() {
   if (process.platform !== 'win32') return { ok: false, error: 'Windows only.' };
-  if (updateState && ['checking', 'downloading', 'verifying', 'installing'].includes(updateState.phase)) return { ok: false, error: 'An update is already in progress.' };
+  if (updateState && ['checking', 'installing'].includes(updateState.phase)) return { ok: false, error: 'An update is already in progress.' };
   let st = null;
   try { st = await adminStatus(); } catch {}
   const taskAvailable = !!(st && st.updater && st.updater.installed);
@@ -827,7 +800,7 @@ async function installUpdate() {
   // everyone else downloads and installs directly (one UAC prompt).
   if (kioskSession && taskAvailable) return installUpdateViaTask();
   if (kioskSession && !taskAvailable) return { ok: false, error: 'Updates from the kiosk account need kiosk mode (which installs the update task). Sign in as an administrator to update.' };
-  return installUpdateNative();
+  return installUpdateElevated();
 }
 
 ipcMain.handle('kiosk:install-update', () => installUpdate());
@@ -881,13 +854,28 @@ function createWindow() {
     },
   });
 
-  // Stay on the kiosk's own server (or our local recovery page).
+  // Stay on the kiosk's own server (or our local recovery page). Compare whole
+  // origins: a prefix test would let "https://app.example.com.evil.net" through.
   win.webContents.on('will-navigate', (e, url) => {
-    if (url.startsWith('file:')) return;
+    let target = null;
+    try { target = new URL(url); } catch {}
+    if (target && target.protocol === 'file:' && target.pathname.endsWith('/recovery.html')) return;
     const p = kioskUrl ? parseKioskUrl(kioskUrl) : null;
-    if (!p || !url.startsWith(p.origin)) { log(`blocked navigation to ${url}`); e.preventDefault(); }
+    if (!p || !target || target.origin !== p.origin) { log(`blocked navigation to ${url}`); e.preventDefault(); }
   });
   win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  // The kiosk page is a map with newsletters and videos: it has no business with
+  // the camera, microphone, location, notifications, clipboard or anything else
+  // Chromium would otherwise grant to a page that asks (Electron allows every
+  // permission request by default).
+  const ses = win.webContents.session;
+  ses.setPermissionRequestHandler((_wc, permission, callback) => {
+    const ok = permission === 'fullscreen';
+    if (!ok) log(`page: denied permission request "${permission}"`);
+    callback(ok);
+  });
+  ses.setPermissionCheckHandler((_wc, permission) => permission === 'fullscreen');
 
   // Network down at boot, DNS failure, connection refused…
   win.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {

@@ -89,7 +89,7 @@ Two data folders, deliberately:
 | Folder | ACL | Contents |
 |--------|-----|----------|
 | `%ProgramData%\FieldLinkKiosk` | kiosk account may **modify** | `config.json` (the kiosk URL) — so the kiosk account can re-link itself from the screen. |
-| `%ProgramData%\FieldLinkKiosk-Admin` | Administrators + SYSTEM full, Users read | copy of the helper the SYSTEM task runs, `update.json` (https server only), `admin.log`, `last-action.json`, `update-status.json`, downloads. Nothing the kiosk account can edit is ever executed or trusted by the updater. |
+| `%ProgramData%\FieldLinkKiosk-Admin` | Administrators + SYSTEM full, Users read | copy of the helper the SYSTEM task runs, `update.json` (the https server updates come from), `admin.log`, `last-action.json`, `update-status.json`, `runs\` (per-run logs), downloads. Nothing the kiosk account can edit is ever executed or trusted by the updater: the updater reads its server from `update.json` (or `-Server`), never from `config.json`. Lockdown takes ownership of both folders and refuses to continue if either is a junction or symbolic link, so a standard user who created them first gains nothing. |
 
 The scheduled task **FieldLinkKiosk Update** runs as SYSTEM daily at 03:15 and 3 minutes after boot. It is
 registered with a security descriptor that lets any signed-in account *start* it (not edit it), and
@@ -101,12 +101,15 @@ How **Install update** on the screen works depends on who is signed in:
 | Session | Path |
 |---------|------|
 | Kiosk account (`isKioskSession`) | `schtasks /Run "FieldLinkKiosk Update"` — the SYSTEM task downloads, verifies, installs and restarts the display; the screen follows `last-action.json`. |
-| Anyone else | `installUpdateNative()` in `main.js` downloads the installer itself, checks size and sha256, then runs it silently after one UAC prompt via a tiny temp `.ps1` that also relaunches the app. No dependency on the helper. |
+| Anyone else | The same helper, run elevated once (`-Action Update -Relaunch`): it downloads into the admin-only folder, checks size and sha256, installs silently and relaunches the app through `explorer.exe`. Nothing is downloaded or verified by the unprivileged app and then handed to the elevated side. |
 
-**Lockdown / Unlock** are started with `Start-Process -Verb RunAs -Wait`, so the app knows exactly when
-they finish and with what exit code. The helper's output is appended (UTF-8) to
-`%TEMP%\FieldLinkKiosk-admin\<Action>-<timestamp>.log`, which the screen tails live under a progress bar;
-`last-action.json` supplies the step list and the final message. Both finish with a restart prompt.
+**Lockdown / Unlock / Update** are started with `Start-Process -Verb RunAs -Wait`, so the app knows exactly
+when they finish and with what exit code. The elevated process runs `kiosk-admin.ps1` straight from the
+install directory (Program Files, administrators only) with a fixed argument list; no wrapper script and
+nothing from the user's profile is ever executed with the admin token. The helper appends its output to
+`%ProgramData%\FieldLinkKiosk-Admin\runs\<Action>-<timestamp>.log` (`-RunLog`, a file name only), which
+the screen tails live under a progress bar; `last-action.json` supplies the step list and the final
+message. Lockdown and Unlock finish with a restart prompt.
 
 Helper rules learned the hard way: keep the file **pure ASCII with a UTF-8 BOM** (PowerShell 5.1 reads a
 BOM-less file as Windows-1252 and an em dash's last byte is a quote character); run native tools through
@@ -144,6 +147,27 @@ Ctrl+Shift+K does (the same snippet as `app/preload.js` in Fieldlink-Pi-Kiosk).
 
 Logs: `%APPDATA%\fieldlink-kiosk\kiosk.log` (app, per user) and `%ProgramData%\FieldLinkKiosk-Admin\admin.log`
 (helper). Both paths are shown on the Ctrl+Shift+K screen.
+
+## Security notes
+
+- **Updates come only from FieldLink.** Whatever server a display shows its map from, installer builds
+  are fetched from `app.fieldlinkmissions.com` (or `app.qa.fieldlinkmissions.com` for a display linked
+  to QA): `TRUSTED_ORIGINS` in `main.js`, `$TrustedUpdateServers` in the helper. Every installer is the
+  same GitHub build, so a self-hosted FieldLink loses nothing. The SYSTEM task reads its server from the
+  admin-only `update.json`; an administrator can point it elsewhere by hand with
+  `kiosk-admin.ps1 -Action InstallUpdater -Server https://…`. Downloads follow no redirects, must match
+  the size and sha256 the server reports, and are refused when the server reports no checksum.
+- **Re-linking from the screen is limited to known servers.** A pasted kiosk URL is accepted for the
+  FieldLink servers, the server the display is already on, and the one entered in the staff-only server
+  field (Ctrl+Shift+S); anything else is refused with a hint. Servers must use https (plain http only
+  for `localhost`). A pairing poll only accepts a kiosk URL on the server that was asked.
+- **The window stays on its server.** Navigation is allowed only to the kiosk URL's exact origin (not a
+  prefix match) or the local recovery page; new windows are denied; every Chromium permission request
+  (camera, microphone, location, notifications, …) is denied except fullscreen.
+- **Electron is kept current** (Dependabot, weekly) because the kiosk renders web content, including
+  newsletters and videos uploaded by churches. Bump and release when a new Electron line ships.
+- The installer is not code-signed yet (see *Release*); the helper logs the Authenticode status but
+  cannot enforce it until there is a certificate.
 
 ## Development
 

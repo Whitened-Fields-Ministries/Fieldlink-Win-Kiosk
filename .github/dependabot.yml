@@ -1,0 +1,15 @@
+# Keep Electron (the Chromium inside the kiosk) and the build tooling current,
+# and the Actions this workflow runs pinned to fresh commits.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      kiosk:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

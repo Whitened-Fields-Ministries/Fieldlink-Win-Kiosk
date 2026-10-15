@@ -66,20 +66,34 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Invalidate server installer cache
+      # Both FieldLink servers cache which build they hand out (and what size and
+      # sha256 to expect); a build replaces the asset under the same name, so a
+      # server that is not told keeps describing the previous one and its next
+      # download fails the size check. Same secret pairs as the Pi kiosk repo:
+      # FIELDLINK_SERVER_URL + KIOSK_WEBHOOK_SECRET (prod) and
+      # FIELDLINK_QA_SERVER_URL + KIOSK_QA_WEBHOOK_SECRET (QA). Unset pairs are skipped.
+      - name: Invalidate the servers' installer cache
         if: success()
         run: |
-          if (-not $env:SERVER_URL) { Write-Host "No SERVER_URL configured, skipping cache invalidation."; exit 0 }
-          try {
-            Invoke-WebRequest -Uri "$env:SERVER_URL/api/kiosk/installer/invalidate" `
-              -Method POST `
-              -Headers @{ "x-webhook-secret" = "$env:WEBHOOK_SECRET"; "Content-Type" = "application/json" } `
-              -UseBasicParsing | Out-Null
-            Write-Host "Cache invalidated successfully"
-          } catch {
-            Write-Host "Cache invalidation skipped: $_"
+          $pairs = @(
+            @{ name = 'prod'; url = $env:SERVER_URL;    secret = $env:WEBHOOK_SECRET },
+            @{ name = 'qa';   url = $env:QA_SERVER_URL; secret = $env:QA_WEBHOOK_SECRET }
+          )
+          foreach ($p in $pairs) {
+            if (-not $p.url -or -not $p.secret) { Write-Host "No $($p.name) server configured, skipping."; continue }
+            try {
+              Invoke-WebRequest -Uri "$($p.url.TrimEnd('/'))/api/kiosk/installer/invalidate" `
+                -Method POST `
+                -Headers @{ "x-webhook-secret" = "$($p.secret)"; "Content-Type" = "application/json" } `
+                -UseBasicParsing | Out-Null
+              Write-Host "$($p.name): cache invalidated"
+            } catch {
+              Write-Host "::warning::$($p.name): cache invalidation skipped ($_); the server refreshes within an hour anyway"
+            }
           }
         shell: pwsh
         env:
           SERVER_URL: ${{ secrets.FIELDLINK_SERVER_URL }}
           WEBHOOK_SECRET: ${{ secrets.KIOSK_WEBHOOK_SECRET }}
+          QA_SERVER_URL: ${{ secrets.FIELDLINK_QA_SERVER_URL }}
+          QA_WEBHOOK_SECRET: ${{ secrets.KIOSK_QA_WEBHOOK_SECRET }}

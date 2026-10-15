@@ -41,7 +41,8 @@ param(
   [string]$Exe = '',            # path to FieldLinkKiosk.exe (auto-detected if empty)
   [string]$Server = '',         # https origin used by the updater (defaults to the one in config.json)
   [switch]$Relaunch,            # Update: start the app again afterwards (app-initiated updates)
-  [switch]$Force                # Update: install even if the version is not newer
+  [switch]$Force,               # Update: install even if the version is not newer
+  [string]$RunLog = ''          # file NAME of a per-run log to write under the admin folder (the app tails it)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,19 +58,54 @@ $UpdateCfg  = Join-Path $AdminDir 'update.json'
 $UpdateLog  = Join-Path $AdminDir 'update-status.json'
 $UpdaterMark = Join-Path $AdminDir 'updater.json'   # written when the task is (un)installed; readable by every account
 $ScriptCopy = Join-Path $AdminDir 'kiosk-admin.ps1'
+$RunLogDir  = Join-Path $AdminDir 'runs'               # one log per elevated run, read by the app's screen
 $TaskName   = 'FieldLinkKiosk Update'
 $WinLogon   = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
 $ProfilePath = "$env:SystemDrive\Users\$KioskUser"
+# Installer builds are only ever fetched from these servers (every installer is
+# the same GitHub build). A display may show the map of another FieldLink server,
+# but a server chosen on the kiosk screen must never be able to hand SYSTEM an exe.
+$DefaultUpdateServer   = 'https://app.fieldlinkmissions.com'
+$TrustedUpdateServers  = @('https://app.fieldlinkmissions.com', 'https://app.qa.fieldlinkmissions.com')
 
 # -- plumbing -----------------------------------------------------------------
 $script:Steps = New-Object System.Collections.ArrayList
+$script:RunLogPath = $null
+function Test-Admin {
+  $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function Test-ReparsePoint([string]$path) {
+  try { $i = Get-Item -LiteralPath $path -Force -ErrorAction Stop; return [bool]($i.Attributes -band [IO.FileAttributes]::ReparsePoint) } catch { return $false }
+}
 function Ensure-AdminDir {
-  if (-not (Test-Path $AdminDir)) { New-Item -ItemType Directory -Path $AdminDir -Force | Out-Null }
+  # Only an administrator creates this folder: a standard user who created it
+  # first would own it, and an owner can always re-grant themselves access to a
+  # folder the SYSTEM updater runs from. The kiosk account only reads here.
+  if (Test-Path -LiteralPath $AdminDir) { return }
+  if (Test-Admin) { New-Item -ItemType Directory -Path $AdminDir -Force | Out-Null }
 }
 function Write-Log([string]$msg, [string]$level = 'info') {
   $line = "[{0}] {1,-5} {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $level.ToUpper(), $msg
   Write-Host $line
   try { Ensure-AdminDir; Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch {}
+  if ($script:RunLogPath) { try { Add-Content -Path $script:RunLogPath -Value $line -Encoding UTF8 } catch {} }
+}
+function Start-RunLog {
+  # -RunLog is a plain file name chosen by the app; it only ever lands inside
+  # the admin folder, so no caller can point an elevated write anywhere else.
+  if (-not $RunLog) { return }
+  if ($RunLog -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$') { Write-Log "Ignoring run log name '$RunLog'" 'warn'; return }
+  if (-not (Test-Admin)) { return }
+  try {
+    Ensure-AdminDir
+    if (Test-ReparsePoint $AdminDir) { throw "$AdminDir is a junction or symbolic link" }
+    if (-not (Test-Path -LiteralPath $RunLogDir)) { New-Item -ItemType Directory -Path $RunLogDir -Force | Out-Null }
+    if (Test-ReparsePoint $RunLogDir) { throw "$RunLogDir is a junction or symbolic link" }
+    $script:RunLogPath = Join-Path $RunLogDir $RunLog
+    Get-ChildItem -LiteralPath $RunLogDir -Filter '*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 20 | Remove-Item -Force -ErrorAction SilentlyContinue
+    Write-Log "helper starting: $Action"
+  } catch { $script:RunLogPath = $null; Write-Log "Run log not available: $_" 'warn' }
 }
 function Step([string]$label, [string]$state = 'ok', [string]$detail = '') {
   [void]$script:Steps.Add([ordered]@{ label = $label; state = $state; detail = $detail })
@@ -110,10 +146,6 @@ function Run-Native([scriptblock]$Command) {
   try { $out = & $Command 2>&1; $code = $LASTEXITCODE; if ($out) { Write-Log ("native: " + (($out | Out-String).Trim() -replace '\s+', ' ')) 'debug' } ; return $code }
   finally { $ErrorActionPreference = $prev }
 }
-function Test-Admin {
-  $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
-  return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
 function Require-Admin { if (-not (Test-Admin)) { Fail "This action needs administrator rights (the app should have asked for them)." } }
 function Find-Exe {
   if ($Exe -and (Test-Path $Exe)) { return (Resolve-Path $Exe).Path }
@@ -145,15 +177,34 @@ function Resolve-Server([string]$s) {
   if (-not $s) { return $s }
   $k = $s.TrimEnd('/').ToLowerInvariant()
   if ($LegacyServers.ContainsKey($k)) { return $LegacyServers[$k] }
-  return $s
+  return $s.TrimEnd('/')
 }
-function Get-ConfiguredServer {
-  if ($Server) { return (Resolve-Server $Server) }
-  $u = Read-Json $UpdateCfg
-  if ($u -and $u.server) { return (Resolve-Server ([string]$u.server)) }
+# The server the display shows its map from (config.json, which the kiosk
+# account may write). Informational only: never a source for the updater.
+function Get-DisplayServer {
   $c = Read-Json (Join-Path $DataDir 'config.json')
   if ($c -and $c.kioskUrl) { try { return (Resolve-Server ([Uri]$c.kioskUrl).GetLeftPart([UriPartial]::Authority)) } catch {} }
   return $null
+}
+# Where the updater downloads from: -Server (an administrator ran the helper by
+# hand), else update.json (written by Install-Updater into the admin-only folder),
+# else production. The kiosk-writable config.json is deliberately not consulted:
+# anyone who can re-link the display from its screen could otherwise pick the
+# server whose exe the SYSTEM task installs.
+function Get-UpdateServer {
+  if ($Server) { return (Resolve-Server $Server) }
+  $u = Read-Json $UpdateCfg
+  if ($u -and $u.server) { return (Resolve-Server ([string]$u.server)) }
+  return $DefaultUpdateServer
+}
+# What Install-Updater records in update.json: -Server, else the display's
+# server when it is one of the FieldLink servers (so a QA display updates from
+# QA), else production.
+function Get-ServerToRecord {
+  if ($Server) { return (Resolve-Server $Server) }
+  $d = Get-DisplayServer
+  if ($d -and ($TrustedUpdateServers -contains $d.ToLowerInvariant())) { return $d.ToLowerInvariant() }
+  return $DefaultUpdateServer
 }
 function Test-ProfileExists {
   # A non-elevated caller is denied inside another user's profile; the folder's
@@ -262,21 +313,47 @@ function Ensure-KioskAccount {
 }
 
 function Ensure-DataDirs {
+  # Both folders live under ProgramData, where any account may create a
+  # subfolder. A standard user who got there first could have planted a
+  # junction (icacls and Copy-Item would follow it into, say, System32) or
+  # would own the folder (an owner can always re-grant themselves access).
+  # So: refuse reparse points, and take ownership before setting the ACLs.
+  foreach ($d in @($DataDir, $AdminDir)) {
+    if ((Test-Path -LiteralPath $d) -and (Test-ReparsePoint $d)) { Fail "$d is a junction or symbolic link. Remove it and run kiosk mode again." }
+  }
   New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
   Ensure-AdminDir
+  foreach ($d in @($DataDir, $AdminDir)) {
+    $rc = Run-Native { icacls "$d" /setowner '*S-1-5-32-544' }
+    if ($rc -ne 0) { throw "icacls /setowner on $d failed (exit $rc)" }
+  }
   # Admin folder: Administrators + SYSTEM full, everyone else read-only. The
   # updater runs as SYSTEM from here, so the kiosk account must not be able
   # to change anything in it.
   # SIDs, not names: SYSTEM, Administrators full; Authenticated Users + Users read.
   $rc = Run-Native { icacls "$AdminDir" /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-11:(OI)(CI)RX' '*S-1-5-32-545:(OI)(CI)RX' }
   if ($rc -ne 0) { throw "icacls on $AdminDir failed (exit $rc)" }
+  # Data folder: the same, then Grant-KioskDataAcl adds the kiosk account.
+  $rc = Run-Native { icacls "$DataDir" /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-11:(OI)(CI)RX' '*S-1-5-32-545:(OI)(CI)RX' }
+  if ($rc -ne 0) { throw "icacls on $DataDir failed (exit $rc)" }
+  foreach ($stale in @((Join-Path $AdminDir 'kiosk-admin.ps1'), (Join-Path $AdminDir 'update.json'))) {
+    if ((Test-Path -LiteralPath $stale) -and (Test-ReparsePoint $stale)) { Fail "$stale is a symbolic link. Remove it and run kiosk mode again." }
+  }
   Step 'Prepared data folders' 'ok' "$DataDir (kiosk may write), $AdminDir (admins only)"
 }
 
-# Called only once the kiosk account exists.
+# Called only once the kiosk account exists. The grant covers the folder (and
+# through inheritance whatever the kiosk account creates in it) and the existing
+# config.json; it is not recursive (/T), which would follow a junction the kiosk
+# account planted inside the folder.
 function Grant-KioskDataAcl {
-  $rc = Run-Native { icacls "$DataDir" /grant "${KioskUser}:(OI)(CI)M" /T }
+  $rc = Run-Native { icacls "$DataDir" /grant "${KioskUser}:(OI)(CI)M" }
   if ($rc -ne 0) { throw "icacls on $DataDir failed (exit $rc)" }
+  $cfg = Join-Path $DataDir 'config.json'
+  if ((Test-Path -LiteralPath $cfg) -and -not (Test-ReparsePoint $cfg)) {
+    $rc = Run-Native { icacls "$cfg" /grant "${KioskUser}:M" }
+    if ($rc -ne 0) { Write-Log "icacls on $cfg failed (exit $rc)" 'warn' }
+  }
   Step "Kiosk account may update $DataDir (for re-linking from the app)"
 }
 
@@ -372,10 +449,9 @@ function Set-PowerSettings([bool]$kiosk) {
 function Install-Updater([string]$serverOrigin) {
   Ensure-DataDirs
   Copy-Item -Path $PSCommandPath -Destination $ScriptCopy -Force
-  if ($serverOrigin) {
-    if ($serverOrigin -notmatch '^https://') { Fail "Updates are only fetched over https ($serverOrigin)" }
-    [ordered]@{ server = $serverOrigin; savedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -Path $UpdateCfg -Encoding UTF8
-  }
+  if (-not $serverOrigin) { $serverOrigin = $DefaultUpdateServer }
+  if ($serverOrigin -notmatch '^https://') { Fail "Updates are only fetched over https ($serverOrigin)" }
+  [ordered]@{ server = $serverOrigin; savedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -Path $UpdateCfg -Encoding UTF8
   $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptCopy`" -Action Update"
   $action   = New-ScheduledTaskAction -Execute $ps -Argument $arg
@@ -412,6 +488,7 @@ function Write-UpdateStatus($obj) {
 
 # -- actions ------------------------------------------------------------------
 try {
+if ($Action -ne 'Status') { Start-RunLog }
 switch ($Action) {
 
   'Status' {
@@ -426,7 +503,8 @@ switch ($Action) {
       autoLogon       = Test-AutoLogonConfigured
       updater         = Get-TaskInfo
       updateStatus    = Read-Json $UpdateLog
-      updateServer    = Get-ConfiguredServer
+      updateServer    = Get-UpdateServer
+      displayServer   = Get-DisplayServer
       lastAction      = Read-Json $ResultFile
       currentUser     = [Security.Principal.WindowsIdentity]::GetCurrent().Name
       isKioskSession  = ([Security.Principal.WindowsIdentity]::GetCurrent().Name -like "*\$KioskUser")
@@ -453,7 +531,7 @@ switch ($Action) {
     Set-AutoLogon -password $password
     $password = $null
     Set-PowerSettings -kiosk $true
-    try { Install-Updater -serverOrigin (Get-ConfiguredServer) } catch { Write-Log "Updater not installed: $_" 'warn'; Step 'Automatic updates could not be scheduled' 'warn' "$_" }
+    try { Install-Updater -serverOrigin (Get-ServerToRecord) } catch { Write-Log "Updater not installed: $_" 'warn'; Step 'Automatic updates could not be scheduled' 'warn' "$_" }
     # verify
     $ok = (Test-AutoLogonConfigured) -and (Test-Path "$ProfilePath\NTUSER.DAT") -and (Get-LocalUser -Name $KioskUser).Enabled
     if (-not $ok) { Fail 'Verification failed - see admin.log' }
@@ -477,7 +555,7 @@ switch ($Action) {
   'InstallUpdater' {
     Require-Admin
     Write-Result -Ok $true -Message 'Starting...' -Running $true
-    Install-Updater -serverOrigin (Get-ConfiguredServer)
+    Install-Updater -serverOrigin (Get-ServerToRecord)
     Write-Result -Ok $true -Message 'Automatic updates are on.'
     exit 0
   }
@@ -498,12 +576,12 @@ switch ($Action) {
       $exe = Find-Exe
       $installed = Get-ExeVersion $exe
       $status.installed = $installed
-      $origin = Get-ConfiguredServer
+      $origin = Get-UpdateServer
       $status.server = $origin
-      if (-not $origin) { throw 'No FieldLink server configured yet (link the display first).' }
       if ($origin -notmatch '^https://') { throw "Refusing to update from a non-https server ($origin)." }
       Write-Log "Update check: installed=$installed server=$origin"
-      $info = Invoke-RestMethod -Uri "$origin/api/kiosk/installer/version" -TimeoutSec 30 -UseBasicParsing -Headers @{ 'User-Agent' = "FieldLinkKiosk-Updater/$installed" }
+      # No redirects: the installer must come from this server over this TLS connection.
+      $info = Invoke-RestMethod -Uri "$origin/api/kiosk/installer/version" -TimeoutSec 30 -UseBasicParsing -MaximumRedirection 0 -Headers @{ 'User-Agent' = "FieldLinkKiosk-Updater/$installed" }
       $latest = [string]$info.version
       $status.latest = $latest
       if (-not $latest) { throw 'Server did not report an installer version.' }
@@ -520,13 +598,19 @@ switch ($Action) {
       $file = Join-Path $dlDir "FieldLinkKiosk-Setup-$latest.exe"
       Write-Log "Downloading $latest from $origin/api/kiosk/installer"
       Write-Result -Ok $true -Message "Downloading FieldLinkKiosk $latest..." -Running $true
-      Invoke-WebRequest -Uri "$origin/api/kiosk/installer" -OutFile $file -TimeoutSec 900 -UseBasicParsing -Headers @{ 'User-Agent' = "FieldLinkKiosk-Updater/$installed" }
+      Invoke-WebRequest -Uri "$origin/api/kiosk/installer" -OutFile $file -TimeoutSec 900 -UseBasicParsing -MaximumRedirection 0 -Headers @{ 'User-Agent' = "FieldLinkKiosk-Updater/$installed" }
       $len = (Get-Item $file).Length
-      if ($info.size -and [int64]$info.size -ne $len) { throw "Download size mismatch (got $len, expected $($info.size))." }
-      if ($info.sha256) {
-        $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
-        if ($hash -ne ([string]$info.sha256).ToLower()) { throw 'Download checksum mismatch - not installing.' }
+      if (-not $info.size -or [int64]$info.size -ne $len) { throw "Download size mismatch (got $len, expected $($info.size))." }
+      # The server reports the sha256 of the exe it serves once it holds a copy;
+      # our download is what made it fetch one, so ask again if it had none yet.
+      $expected = [string]$info.sha256
+      if (-not $expected) {
+        $again = Invoke-RestMethod -Uri "$origin/api/kiosk/installer/version" -TimeoutSec 30 -UseBasicParsing -MaximumRedirection 0 -Headers @{ 'User-Agent' = "FieldLinkKiosk-Updater/$installed" }
+        if ([string]$again.version -eq $latest) { $expected = [string]$again.sha256 }
       }
+      if (-not $expected) { throw 'Server gave no checksum for the installer - not installing.' }
+      $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+      if ($hash -ne $expected.ToLower()) { throw 'Download checksum mismatch - not installing.' }
       $sig = Get-AuthenticodeSignature -FilePath $file
       Write-Log "Installer signature: $($sig.Status)"
       $wasRunning = [bool](Get-Process -Name 'FieldLinkKiosk' -ErrorAction SilentlyContinue)

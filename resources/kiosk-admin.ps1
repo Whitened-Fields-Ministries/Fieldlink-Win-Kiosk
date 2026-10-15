@@ -643,10 +643,21 @@ switch ($Action) {
       }
       exit 0
     } catch {
-      $status.result = 'failed'; $status.error = "$_"
+      # A readable reason, never a response body: when the server (or the proxy in
+      # front of it while the site is updating) answers an error page, PowerShell
+      # 5.1 puts that page's text into the error record, which the screen showed
+      # as a wall of CSS. Report the HTTP status instead, and keep it short.
+      $msg = $_.Exception.Message
+      if ($_.Exception -is [System.Net.WebException] -and $_.Exception.Response) {
+        $code = [int]$_.Exception.Response.StatusCode
+        $msg = "the FieldLink server answered HTTP $code" + $(if ($code -ge 500) { ' (it may be updating itself; the next check will try again)' } else { '' })
+      }
+      $msg = ($msg -replace '\s+', ' ').Trim()
+      if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) + '...' }
+      $status.result = 'failed'; $status.error = $msg
       Write-UpdateStatus $status
-      Write-Log "Update failed: $_" 'error'
-      Write-Result -Ok $false -Message "Update failed: $_" -Extra $status
+      Write-Log "Update failed: $msg" 'error'
+      Write-Result -Ok $false -Message "Update failed: $msg" -Extra $status
       exit 1
     }
   }

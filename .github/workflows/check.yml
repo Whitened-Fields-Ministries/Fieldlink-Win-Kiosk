@@ -1,0 +1,46 @@
+name: Checks
+
+# Pull requests: the same checks the build runs (syntax, unit tests, the
+# helper under Windows PowerShell 5.1, the smoke test in a real window), and
+# that a change to the app comes with a version no build has used yet. No
+# installer is built and nothing is published.
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          ELECTRON_GET_TIMEOUT: '120000'
+
+      - name: Syntax checks and unit tests
+        run: npm run check && npm test
+        shell: bash
+
+      - name: Check the privileged helper (Windows PowerShell 5.1)
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-helper.ps1
+        shell: bash
+
+      - name: Smoke test
+        run: npm run smoke
+        shell: bash
+
+      - name: The version is new, or the app is unchanged
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/qa-release-state.sh

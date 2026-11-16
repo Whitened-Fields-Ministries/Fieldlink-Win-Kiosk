@@ -171,6 +171,9 @@
       <b>Last check</b><span id="m-check">—</span>
       <b>Config file</b><span id="m-config">—</span>
       <b>Log file</b><span id="m-log">—</span>
+      <b>Helper log</b><span id="m-adminlog">—</span>
+      <b>Screen</b><span id="m-screen">—</span>
+      <b>Time zone</b><span id="m-tz">—</span>
       <b>Computer</b><span id="m-host">—</span>
       <b>App</b><span id="m-app">—</span>
     </div>
@@ -281,6 +284,13 @@
     $('m-config').textContent = s.configSource || ('none yet — will be created at ' + (s.configTargets && s.configTargets[0]));
     $('m-log').textContent    = s.logPath || '—';
     $('m-host').textContent   = s.hostname || '—';
+    const d = s.display;
+    $('m-screen').textContent = d && d.width
+      ? d.width + ' × ' + d.height + ' · shown at ' + d.scale + '× (' + (d.pinned ? 'set in config.json' : 'calculated from the resolution') + (d.windowsScale && d.windowsScale !== 1 ? '; Windows scale ' + Math.round(d.windowsScale * 100) + ' %' : '') + ')'
+      : '—';
+    const tz = s.timezone || {};
+    $('m-tz').textContent = (tz.pc || '—') + (tz.differs ? ' on this PC, but the church is in ' + tz.church + ': the clock on the display follows the PC. Change it in Windows Settings → Time & language.' : (tz.church ? ' (same time as the church\'s, ' + tz.church + ')' : ''));
+    $('m-tz').style.color = tz.differs ? 'var(--warn)' : '';
     $('m-app').textContent    = 'FieldLinkKiosk ' + (s.appVersion || '?') + ' · Electron ' + (s.electron || '?');
     if (!$('server').value) $('server').value = s.server || (s.pair && s.pair.origin) || s.defaultServer || '';
     renderPair(s.pair);
@@ -307,6 +317,7 @@
     admin = a;
     const lock = $('lock-btn'), unlock = $('unlock-btn'), restart = $('restart-btn');
     lock.classList.add('hidden'); unlock.classList.add('hidden');
+    $('m-adminlog').textContent = (a && a.logFile) || '—';
     if (!a || a.unsupported) { setPill('admin-pill', 'n/a', ''); $('admin-text').textContent = (a && a.reason) || 'Not available here.'; $('admin-hint').classList.add('hidden'); return; }
     if (a.error) { setPill('admin-pill', 'unknown', 'warn'); $('admin-text').textContent = 'Could not read this PC\'s kiosk status: ' + a.error; lock.classList.remove('hidden'); return; }
     if (a.lockedDown) {
@@ -353,7 +364,7 @@
     const labels = { Lockdown: 'Setting up kiosk mode', Unlock: 'Removing kiosk mode', Update: 'Updating', InstallUpdater: 'Scheduling automatic updates', RemoveUpdater: 'Removing automatic updates' };
     if (j.running) {
       $('job-title').innerHTML = '<span class="spin"></span>' + (labels[j.action] || j.action) + '…';
-      $('job-status').textContent = r && r.message ? r.message : (j.logTail && j.logTail.length ? 'Running — Windows may be showing a permission prompt behind this window.' : 'Waiting for administrator permission (look for the Windows prompt)…');
+      $('job-status').textContent = r && r.message ? r.message : (j.logTail && j.logTail.length ? 'Running — Windows may be showing a permission prompt behind this window.' : 'Waiting for administrator permission. If no Windows prompt is in front, click the flashing shield on the taskbar (or press Alt+Tab).');
     } else if (j.error || (r && r.ok === false)) {
       bar.classList.add('failed');
       $('job-title').textContent = (labels[j.action] || j.action) + ' failed';
@@ -465,7 +476,7 @@
     if (serverRevealed && !$('server-field').classList.contains('hidden')) { $('server').focus(); $('server').select(); }
   });
 
-  if (bridge) {
+  if (bridge && !new URLSearchParams(location.search).get('smoke')) {
     bridge.onState(render);
     bridge.getState().then(render);
     refreshAdmin();
@@ -473,9 +484,9 @@
     // An action may still be running from before this page was (re)opened.
     bridge.adminJob().then(j => { if (j) { renderJob(j); if (j.running) { setBusy(true); watchJob(); } } });
   } else {
-    // Opened outside the app (e.g. in a browser while developing).
+    // Opened outside the app (e.g. in a browser while developing) or by the CI smoke test.
     render({ reason: new URLSearchParams(location.search).get('reason') || 'no-config', hasConfig: false, defaultServer: 'https://app.fieldlinkmissions.com', configTargets: ['(not running inside the kiosk app)'], pair: { status: 'waiting', code: 'K7M-3PX', expiresAt: Date.now() + 14 * 60 * 1000, origin: 'https://app.fieldlinkmissions.com' } });
-    renderAdmin({ lockedDown: false, accountExists: false, updater: { installed: false } });
+    renderAdmin({ lockedDown: false, accountExists: false, updater: { installed: false }, logFile: '(not running inside the kiosk app)' });
     renderUpdate({ installed: '1.2.0', latest: '1.2.0', newer: false });
   }
 })();

@@ -1,4 +1,14 @@
-name: Build Kiosk Installer
+name: Build QA installer
+
+# Every build is a QA build first. A push to main (or a manual run, from any
+# branch) checks the app, builds the installer once and publishes it as the
+# pre-release vX.Y.Z-qa. Only the QA FieldLink server offers a pre-release to
+# its displays; production keeps handing out the last promoted build until
+# "Promote to prod" (promote.yml) republishes these same bytes as vX.Y.Z.
+#
+# The version in package.json names the build. A push that changes the app
+# without a new version fails here (scripts/qa-release-state.sh); a push that
+# changes nothing in the app (docs, workflows) publishes nothing.
 
 on:
   push:
@@ -10,6 +20,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-qa
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -25,6 +39,34 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+        env:
+          ELECTRON_GET_TIMEOUT: '120000'
+
+      - name: Syntax checks and unit tests
+        run: npm run check && npm test
+        shell: bash
+
+      - name: Check the privileged helper (Windows PowerShell 5.1)
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-helper.ps1
+        shell: bash
+
+      # The real app in a real window on Windows: settings screen, display
+      # scale, mouse pointer, corner hold.
+      - name: Smoke test
+        run: npm run smoke
+        shell: bash
+
+      - name: Publish or not?
+        id: state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state=$(scripts/qa-release-state.sh)
+          version=$(node -p "require('./package.json').version")
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "FieldLinkKiosk $version: $state"
 
       - name: Build installer
         run: npm run build -- --publish never
@@ -37,63 +79,55 @@ jobs:
           name: FieldLinkKiosk-installer
           path: dist/*.exe
 
-      # The installer name carries the version, so without this the "latest"
-      # release would accumulate one .exe per build and the FieldLink server
-      # (which serves the release's installer) could hand out an old one.
-      - name: Remove previous installers from the latest release
-        shell: pwsh
-        continue-on-error: true
+      - name: Publish the QA pre-release
+        if: steps.state.outputs.state == 'publish'
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.state.outputs.version }}
+          BRANCH: ${{ github.ref_name }}
         run: |
-          $ErrorActionPreference = 'Continue'
-          $names = gh release view latest --repo $env:GITHUB_REPOSITORY --json assets -q '.assets[].name' 2>$null
-          if (-not $names) { Write-Host 'No existing latest release or no assets.'; exit 0 }
-          foreach ($n in $names) {
-            if ($n -like '*.exe' -or $n -like '*.blockmap' -or $n -like '*.yml') {
-              Write-Host "Deleting old asset $n"
-              gh release delete-asset latest $n --repo $env:GITHUB_REPOSITORY --yes
-            }
-          }
+          exe="dist/FieldLinkKiosk-Setup-$VERSION.exe"
+          test -f "$exe"
+          sha=$(sha256sum "$exe" | cut -d' ' -f1)
+          {
+            echo "QA build of FieldLinkKiosk $VERSION, built from \`$BRANCH\` at $GITHUB_SHA."
+            echo
+            echo "Only the QA FieldLink server offers this build to its displays. After testing, run **Promote to prod** with version \`$VERSION\` to publish the same file to production."
+            echo
+            echo "sha256 \`$sha\`"
+          } > notes.md
+          gh release create "v$VERSION-qa" "$exe" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --prerelease --latest=false --title "FieldLinkKiosk $VERSION (QA)" --notes-file notes.md
+          {
+            echo "## FieldLinkKiosk $VERSION published to QA"
+            echo
+            echo "- Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VERSION-qa"
+            echo "- sha256 \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Create or update release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          tag_name: latest
-          name: FieldLinkKiosk Installer
-          files: dist/*.exe
-          make_latest: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Nothing to publish
+        if: steps.state.outputs.state != 'publish'
+        shell: bash
+        run: echo "::notice::FieldLinkKiosk ${{ steps.state.outputs.version }} is already published from these app files; nothing new to publish."
 
-      # Both FieldLink servers cache which build they hand out (and what size and
-      # sha256 to expect); a build replaces the asset under the same name, so a
-      # server that is not told keeps describing the previous one and its next
-      # download fails the size check. Same secret pairs as the Pi kiosk repo:
-      # FIELDLINK_SERVER_URL + KIOSK_WEBHOOK_SECRET (prod) and
-      # FIELDLINK_QA_SERVER_URL + KIOSK_QA_WEBHOOK_SECRET (QA). Unset pairs are skipped.
-      - name: Invalidate the servers' installer cache
-        if: success()
-        run: |
-          $pairs = @(
-            @{ name = 'prod'; url = $env:SERVER_URL;    secret = $env:WEBHOOK_SECRET },
-            @{ name = 'qa';   url = $env:QA_SERVER_URL; secret = $env:QA_WEBHOOK_SECRET }
-          )
-          foreach ($p in $pairs) {
-            if (-not $p.url -or -not $p.secret) { Write-Host "No $($p.name) server configured, skipping."; continue }
-            try {
-              Invoke-WebRequest -Uri "$($p.url.TrimEnd('/'))/api/kiosk/installer/invalidate" `
-                -Method POST `
-                -Headers @{ "x-webhook-secret" = "$($p.secret)"; "Content-Type" = "application/json" } `
-                -UseBasicParsing | Out-Null
-              Write-Host "$($p.name): cache invalidated"
-            } catch {
-              Write-Host "::warning::$($p.name): cache invalidation skipped ($_); the server refreshes within an hour anyway"
-            }
-          }
+      # The QA server caches which build it hands out; tell it now instead of
+      # letting it find out within the hour. FIELDLINK_QA_SERVER_URL +
+      # KIOSK_QA_WEBHOOK_SECRET (the same secrets the Pi kiosk repo uses).
+      - name: Tell the QA server
+        if: steps.state.outputs.state == 'publish'
         shell: pwsh
         env:
-          SERVER_URL: ${{ secrets.FIELDLINK_SERVER_URL }}
-          WEBHOOK_SECRET: ${{ secrets.KIOSK_WEBHOOK_SECRET }}
           QA_SERVER_URL: ${{ secrets.FIELDLINK_QA_SERVER_URL }}
           QA_WEBHOOK_SECRET: ${{ secrets.KIOSK_QA_WEBHOOK_SECRET }}
+        run: |
+          if (-not $env:QA_SERVER_URL -or -not $env:QA_WEBHOOK_SECRET) { Write-Host 'No QA server configured, skipping.'; exit 0 }
+          try {
+            Invoke-WebRequest -Uri "$($env:QA_SERVER_URL.TrimEnd('/'))/api/kiosk/installer/invalidate" `
+              -Method POST `
+              -Headers @{ "x-webhook-secret" = "$($env:QA_WEBHOOK_SECRET)"; "Content-Type" = "application/json" } `
+              -UseBasicParsing | Out-Null
+            Write-Host 'qa: cache invalidated'
+          } catch {
+            Write-Host "::warning::qa: cache invalidation skipped ($_); the server refreshes within an hour anyway"
+          }

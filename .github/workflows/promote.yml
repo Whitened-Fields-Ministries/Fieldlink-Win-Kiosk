@@ -1,0 +1,82 @@
+name: Promote to prod
+
+# Publishes a tested QA build to production: pick a version whose vX.Y.Z-qa
+# pre-release has been tried on a QA display, and this republishes the very
+# same installer as the release vX.Y.Z, marked latest. No rebuild. Production
+# FieldLink servers hand out the latest release, so displays linked to
+# production install it at their next nightly check.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to promote (X.Y.Z, e.g. 1.7.0). Its vX.Y.Z-qa release must exist.
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: promote-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.version }} to prod
+    runs-on: ubuntu-latest
+    steps:
+      # The input reaches the shell through the environment, never by
+      # expression substitution into the script text.
+      - name: Promote
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then echo "::error::'$VERSION' is not a version like 1.7.0"; exit 1; fi
+          qa="v$VERSION-qa"; prod="v$VERSION"; exe="FieldLinkKiosk-Setup-$VERSION.exe"
+          if gh release view "$prod" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then echo "::error::$prod is already published"; exit 1; fi
+          info=$(gh release view "$qa" --repo "$GITHUB_REPOSITORY" --json isPrerelease,targetCommitish,assets) || { echo "::error::There is no $qa release to promote"; exit 1; }
+          [ "$(jq -r .isPrerelease <<<"$info")" = "true" ] || { echo "::error::$qa is not a QA pre-release"; exit 1; }
+          [ "$(jq -r '[.assets[].name | select(endswith(".exe"))] | join(",")' <<<"$info")" = "$exe" ] || { echo "::error::$qa must hold exactly one installer, $exe"; exit 1; }
+          commit=$(jq -r .targetCommitish <<<"$info")
+          mkdir out
+          gh release download "$qa" --repo "$GITHUB_REPOSITORY" --pattern "$exe" --dir out
+          sha=$(sha256sum "out/$exe" | cut -d' ' -f1)
+          {
+            echo "FieldLinkKiosk $VERSION. The same installer as the QA build [$qa](https://github.com/$GITHUB_REPOSITORY/releases/tag/$qa), built from $commit."
+            echo
+            echo "sha256 \`$sha\`"
+          } > notes.md
+          gh release create "$prod" "out/$exe" --repo "$GITHUB_REPOSITORY" --target "$commit" \
+            --latest --title "FieldLinkKiosk $VERSION" --notes-file notes.md
+          {
+            echo "## FieldLinkKiosk $VERSION promoted to prod"
+            echo
+            echo "- Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$prod"
+            echo "- sha256 \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Both servers cache which build they hand out. FIELDLINK_SERVER_URL +
+      # KIOSK_WEBHOOK_SECRET (prod) and FIELDLINK_QA_SERVER_URL +
+      # KIOSK_QA_WEBHOOK_SECRET (QA); an unset pair is skipped, and a server
+      # that is not told finds out within the hour.
+      - name: Tell the servers
+        env:
+          SERVER_URL: ${{ secrets.FIELDLINK_SERVER_URL }}
+          WEBHOOK_SECRET: ${{ secrets.KIOSK_WEBHOOK_SECRET }}
+          QA_SERVER_URL: ${{ secrets.FIELDLINK_QA_SERVER_URL }}
+          QA_WEBHOOK_SECRET: ${{ secrets.KIOSK_QA_WEBHOOK_SECRET }}
+        run: |
+          tell() {
+            name=$1; url=$2; secret=$3
+            if [ -z "$url" ] || [ -z "$secret" ]; then echo "No $name server configured, skipping."; return; fi
+            if curl -fsS -X POST -H "x-webhook-secret: $secret" -H 'Content-Type: application/json' "${url%/}/api/kiosk/installer/invalidate" >/dev/null; then
+              echo "$name: cache invalidated"
+            else
+              echo "::warning::$name: cache invalidation skipped; the server refreshes within an hour anyway"
+            fi
+          }
+          tell prod "$SERVER_URL" "$WEBHOOK_SECRET"
+          tell qa "$QA_SERVER_URL" "$QA_WEBHOOK_SECRET"

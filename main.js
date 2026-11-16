@@ -21,12 +21,18 @@
 //   Ctrl+Shift+K  open the settings / recovery screen
 //   Ctrl+Shift+R  reload the kiosk page
 //   Ctrl+Shift+Q  quit the app
+//
+// Flags:
+//   --smoke-test  start, load the settings screen once, check the display
+//                 scale, the mouse pointer and the corner hold, exit 0. CI runs
+//                 it on a Windows runner before building the installer.
 
-const { app, BrowserWindow, globalShortcut, ipcMain, net, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, net, powerSaveBlocker, screen } = require('electron');
 const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
 const { execFile } = require('child_process');
+const displayScale = require('./display-scale');
 
 const APP_VERSION        = app.getVersion();
 // The FieldLink app lives on the app. host; the bare domain is the public website.
@@ -53,6 +59,7 @@ const HEALTH_INTERVAL_MS = 30 * 1000;          // steady-state key/server check
 const RETRY_STEPS_MS     = [5000, 10000, 20000, 30000]; // backoff while offline
 const REQUEST_TIMEOUT_MS = 15 * 1000;
 const KEY_RE             = /^fl_kiosk_[0-9a-f]{16,}$/i;
+const SMOKE_TEST         = process.argv.includes('--smoke-test');
 
 // Videos in missionary updates should play without a click on a lobby TV.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -108,7 +115,7 @@ function loadConfig() {
 }
 
 // Writable targets, in order of preference. ProgramData is machine-wide and is
-// made writable for the kiosk user by SETUP-KIOSK-MODE.ps1; userData always works.
+// made writable for the kiosk account by kiosk mode (kiosk-admin.ps1); userData always works.
 function writableConfigTargets() {
   const list = [];
   const pd = programDataConfigPath();
@@ -257,6 +264,8 @@ function stateForPage() {
     configSource,
     configTargets: writableConfigTargets(),
     logPath:       logPath(),
+    timezone:      timezoneForPage(),
+    display,
     lastCheck,
     lastGoodAt,
     nextCheckAt,
@@ -267,6 +276,34 @@ function stateForPage() {
     updateState,
     adminJob: adminJob ? { action: adminJob.action, running: adminJob.running, startedAt: adminJob.startedAt, exitCode: adminJob.exitCode, error: adminJob.error } : null,
   };
+}
+
+// ── Time zone ────────────────────────────────────────────────────────────────
+// The server says which zone the church's address is in (/whoami "timezone",
+// FieldLink 2.55.0 and later). A Windows PC has its own zone, set by whoever
+// installed Windows, and this app never changes it; but the clock on the kiosk
+// page follows the PC, so the settings screen says so when the two disagree.
+// Zones are compared by what the clock shows (now and half a year from now),
+// not by name: "America/Indianapolis" and "America/New_York" are the same time.
+function zoneOffsetMinutes(tz, date) {
+  try {
+    const part = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'longOffset' }).formatToParts(date).find(x => x.type === 'timeZoneName');
+    const m = /GMT(?:([+-])(\d{1,2})(?::(\d{2}))?)?/.exec(part ? part.value : '');
+    if (!m) return null;
+    return m[1] ? (m[1] === '-' ? -1 : 1) * (parseInt(m[2], 10) * 60 + parseInt(m[3] || '0', 10)) : 0;
+  } catch { return null; }
+}
+function timezoneForPage() {
+  let pc = null;
+  try { pc = Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch {}
+  const church = keyInfo && typeof keyInfo.timezone === 'string' && keyInfo.timezone ? keyInfo.timezone : null;
+  let differs = false;
+  if (pc && church && pc !== church) {
+    const now = new Date(), later = new Date(now.getTime() + 182 * 24 * 3600 * 1000);
+    const pairs = [[zoneOffsetMinutes(pc, now), zoneOffsetMinutes(church, now)], [zoneOffsetMinutes(pc, later), zoneOffsetMinutes(church, later)]];
+    differs = pairs.some(([a, b]) => a !== null && b !== null && a !== b);
+  }
+  return { pc, church, differs };
 }
 
 function pushState() {
@@ -292,7 +329,8 @@ function applyConfig() {
   configSource = source;
   const parsed = config && config.kioskUrl ? parseKioskUrl(config.kioskUrl) : null;
   kioskUrl = parsed ? migrateLegacyOrigin(parsed) : null;
-  if (config && config.kioskUrl && !parsed) log(`config: kioskUrl is not a valid URL: ${config.kioskUrl}`);
+  // Never the value itself: a URL that fails the https rule still carries the whole key.
+  if (config && config.kioskUrl && !parsed) log(`config: kioskUrl in ${source} is not a usable https kiosk address (${String(config.kioskUrl).length} characters, not logged)`);
   log(`config: ${kioskUrl ? `using ${source}` : 'no usable config found'} (candidates: ${configCandidates().join(' | ')})`);
   return !!kioskUrl;
 }
@@ -361,7 +399,7 @@ async function runCheck() {
   try {
     if (!kioskUrl) {
       showRecovery('no-config');
-      scheduleCheck(HEALTH_INTERVAL_MS);
+      scheduleCheck(pair && pair.status === 'error' ? backoffDelay(1) : HEALTH_INTERVAL_MS);
       return;
     }
     const result = await checkKey(kioskUrl);
@@ -411,7 +449,7 @@ async function runCheck() {
   }
 }
 
-// ── Config file watching (INSTALL.bat re-run while the app is open) ──────────
+// ── Config file watching (config.json written from outside the app) ──────────
 let watchTimer = null;
 function watchConfigDirs() {
   const dirs = [...new Set(configCandidates().map(p => path.dirname(p)))];
@@ -430,6 +468,7 @@ function watchConfigDirs() {
 function onConfigChanged() {
   const before = kioskUrl;
   applyConfig();
+  applyDisplayScale();
   if (kioskUrl && kioskUrl !== before) {
     log('config: kioskUrl changed on disk — reloading');
     invalidStreak = 0; keyInfo = null;
@@ -467,6 +506,7 @@ ipcMain.handle('kiosk:set-url', async (_e, { text, server } = {}) => {
 ipcMain.handle('kiosk:retry', async () => {
   if (checkTimer) clearTimeout(checkTimer);
   invalidStreak = 0;
+  if (pair && pair.status === 'error') startPairRequest(pair.origin);
   await runCheck();
   return stateForPage();
 });
@@ -532,7 +572,11 @@ async function startPairRequest(serverText) {
     if (pair !== mine) return;
     mine.status = 'error';
     mine.error = `Cannot reach ${origin} (${e && e.message ? e.message : e}).`;
+    log(`pair-request: ${mine.error}`);
     pushState();
+    // Retry on our own while the settings screen is up (the network is often
+    // not there yet at boot); the health loop only retries in some states.
+    mine.timer = setTimeout(() => { if (pair === mine && view === 'recovery') startPairRequest(origin); }, backoffDelay(1));
   }
 }
 
@@ -546,8 +590,10 @@ async function pollPairRequest() {
       const parsed = parseKioskUrl(r.body.url);
       // The server we asked may only link us to itself (a legacy host moves to its app. host).
       if (parsed && parsed.key && KEY_RE.test(parsed.key) && (parsed.origin === p.origin || LEGACY_ORIGINS[parsed.origin] === p.origin)) {
-        const saved = saveConfig({ kioskUrl: `${p.origin}/kiosk?key=${parsed.key}` });
-        keyInfo = r.body.key || null; kioskUrl = parsed.url; configSource = saved; invalidStreak = 0;
+        // Use what was saved: a legacy host in the answer must not be the URL this run loads.
+        const linked = `${p.origin}/kiosk?key=${parsed.key}`;
+        const saved = saveConfig({ kioskUrl: linked });
+        keyInfo = r.body.key || null; kioskUrl = linked; configSource = saved; invalidStreak = 0;
         log(`pair-request: linked as "${(r.body.key && r.body.key.name) || '?'}" — saved to ${saved}`);
         stopPairRequest();
         showKiosk();
@@ -629,6 +675,33 @@ function readAdminResult() {
 
 let adminJob = null; // { action, startedAt, finishedAt, running, exitCode, logFile, error }
 
+// Windows often opens its permission prompt as a flashing taskbar button
+// instead of in front, and a full-screen window covers the taskbar, so the
+// prompt looked like "nothing happens". While the app waits for the answer the
+// window therefore leaves full screen and shrinks to the work area (the screen
+// minus the taskbar); it goes back as soon as the helper is running (its log
+// file appears) or the request is over.
+let loweredBounds = null;
+function lowerForPrompt() {
+  if (!win || win.isDestroyed() || loweredBounds) return;
+  try {
+    loweredBounds = win.getBounds();
+    const area = screen.getDisplayMatching(loweredBounds).workArea;
+    win.setKiosk(false);
+    win.setFullScreen(false);
+    win.setAlwaysOnTop(false);
+    win.setBounds(area);
+    log('window: left full screen while Windows asks for permission');
+  } catch (e) { log(`window: could not leave full screen: ${e.message}`); }
+}
+function restoreAfterPrompt() {
+  if (!loweredBounds) return;
+  loweredBounds = null;
+  if (!win || win.isDestroyed()) return;
+  try { win.setFullScreen(true); win.setKiosk(true); win.focus(); log('window: back to full screen'); }
+  catch (e) { log(`window: could not return to full screen: ${e.message}`); }
+}
+
 function tailFile(file, maxLines) {
   try {
     const buf = fs.readFileSync(file);
@@ -672,7 +745,11 @@ async function adminRunElevated(action) {
 
   const helperArgs = `-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${adminScriptPath()}" -Action ${action} -Exe "${app.getPath('exe')}" -RunLog "${runLog}"${action === 'Update' ? ' -Relaunch' : ''}`;
   const cmd = `$p = Start-Process -FilePath '${q(psExe())}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru -ArgumentList '${q(helperArgs)}'; exit $p.ExitCode`;
+  lowerForPrompt();
+  const promptWatch = setInterval(() => { if (fs.existsSync(logFile)) { clearInterval(promptWatch); restoreAfterPrompt(); } }, 500);
   const r = await runPs(['-Command', cmd], 15 * 60 * 1000);
+  clearInterval(promptWatch);
+  restoreAfterPrompt();
   adminJob.running = false;
   adminJob.finishedAt = Date.now();
   adminJob.exitCode = r.code;
@@ -812,6 +889,42 @@ ipcMain.handle('kiosk:admin-run', (_e, { action } = {}) => adminRunElevated(acti
 ipcMain.handle('kiosk:admin-result', () => readAdminResult());
 ipcMain.handle('kiosk:admin-job', () => adminJobSnapshot());
 ipcMain.handle('kiosk:check-update', () => checkUpdate());
+// ── Mouse pointer ────────────────────────────────────────────────────────────
+// A lobby display has no mouse in use, but Windows draws a pointer as soon as
+// anything that could be one is plugged in (a keyboard's receiver is enough),
+// and it would sit on the map for good. The pointer is hidden on every page
+// until a mouse actually moves, and again a few seconds after it stops:
+// there when someone needs it, gone otherwise. Touch never shows it.
+// preload.js reports mouse movement; the hiding is a style sheet inserted from
+// here, which a page's own content-security policy cannot refuse.
+// Same as Fieldlink-Pi-Kiosk.
+const POINTER_HIDE_AFTER_MS = 5000;
+const POINTER_HIDE_CSS = '*, *::before, *::after { cursor: none !important; }';
+let pointerHidden = true;       // what we want right now
+let pointerCssKey = null;       // the inserted style sheet, while hidden
+let pointerTimer = null;
+
+async function hidePointer() {
+  pointerHidden = true;
+  if (!win || win.isDestroyed() || win.webContents.isDestroyed() || pointerCssKey) return;
+  try {
+    const key = await win.webContents.insertCSS(POINTER_HIDE_CSS, { cssOrigin: 'user' });
+    // Moved again, or already hidden by another call, while this one was in flight: take it back out.
+    if (!pointerHidden || pointerCssKey) win.webContents.removeInsertedCSS(key).catch(() => {});
+    else pointerCssKey = key;
+  } catch {}
+}
+function showPointer() {
+  pointerHidden = false;
+  const key = pointerCssKey; pointerCssKey = null;
+  if (key && win && !win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.removeInsertedCSS(key).catch(() => {});
+  if (pointerTimer) clearTimeout(pointerTimer);
+  pointerTimer = setTimeout(hidePointer, POINTER_HIDE_AFTER_MS);
+}
+// A new page starts without the style sheet: put it back unless a mouse is in use.
+function pointerOnNewPage() { pointerCssKey = null; if (pointerHidden) hidePointer(); }
+ipcMain.on('kiosk:pointer-moved', (e) => { if (win && !win.isDestroyed() && e.sender === win.webContents) showPointer(); });
+
 // ── The settings screen: Ctrl+Shift+K and the corner-hold gesture ────────────
 // The gesture itself is detected in preload.js (it needs the page's pointer
 // events); it only ever asks for the same thing Ctrl+Shift+K does.
@@ -820,9 +933,11 @@ function toggleSettingsScreen(source) {
   if (view === 'recovery' && recoveryReason === 'manual') { if (kioskUrl) showKiosk(); }
   else showRecovery('manual');
 }
+let smokeGestureSeen = false;
 ipcMain.on('kiosk:gesture', (e, { name } = {}) => {
   if (!win || win.isDestroyed() || e.sender !== win.webContents) return;
   if (name !== 'corner-hold') return;
+  if (SMOKE_TEST) { smokeGestureSeen = true; return; }
   toggleSettingsScreen('corner hold');
 });
 
@@ -833,12 +948,50 @@ ipcMain.handle('kiosk:restart', () => {
   return { ok: true };
 });
 
+// ── Display scale ────────────────────────────────────────────────────────────
+// The pages are laid out for a 1080p TV, and Windows' own "Scale" setting is
+// whatever the PC came with. display-scale.js works out the magnification from
+// the screen's resolution (or takes config.json's "displayScale"); what Windows
+// already applies is divided out and the rest is set as the page zoom.
+let display = { width: null, height: null, scale: 1, zoom: 1, pinned: false, windowsScale: 1 };
+
+function measureDisplay() {
+  let physical = null, dsf = 1;
+  try {
+    // The screen the window is on (a PC can have a second one), else the primary.
+    const d = win && !win.isDestroyed() ? screen.getDisplayMatching(win.getBounds()) : screen.getPrimaryDisplay();
+    dsf = d.scaleFactor || 1;
+    physical = { width: Math.round(d.size.width * dsf), height: Math.round(d.size.height * dsf) };
+  } catch (e) { log(`display: cannot read the screen size: ${e.message}`); }
+  const { config } = loadConfig();
+  const override = config ? config.displayScale : undefined;
+  const next = {
+    width: physical ? physical.width : null, height: physical ? physical.height : null,
+    scale: displayScale.scaleFor(physical, override), zoom: displayScale.zoomFor(physical, dsf, override),
+    pinned: displayScale.parseOverride(override) !== null,
+    windowsScale: dsf,
+  };
+  if (next.width !== display.width || next.height !== display.height || next.zoom !== display.zoom) {
+    log(`display: ${next.width || '?'}×${next.height || '?'} → ${next.scale}× (${next.pinned ? 'set in config.json' : 'calculated'}${dsf !== 1 ? `, Windows already scales ${dsf}×` : ''})`);
+  }
+  display = next;
+  return display;
+}
+
+function applyDisplayScale() {
+  measureDisplay();
+  if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) {
+    try { win.webContents.setZoomFactor(display.zoom); } catch (e) { log(`display: cannot set the zoom: ${e.message}`); }
+  }
+  pushState();
+}
+
 // ── Window ───────────────────────────────────────────────────────────────────
 function createWindow() {
-  const { config } = loadConfig();
+  measureDisplay();
   win = new BrowserWindow({
-    width:  (config && config.width)  || 1920,
-    height: (config && config.height) || 1080,
+    width:  1920,
+    height: 1080,
     fullscreen: true,
     kiosk: true,
     frame: false,
@@ -851,8 +1004,18 @@ function createWindow() {
       sandbox: true,
       spellcheck: false,
       additionalArguments: [`--flk-version=${APP_VERSION}`],
+      zoomFactor: display.zoom,
     },
   });
+
+  // Chromium keeps zoom per site, so every page this window loads gets it again;
+  // a TV swapped for another resolution, or a changed Windows scale setting, is
+  // picked up without a restart.
+  win.webContents.on('dom-ready', applyDisplayScale);
+  win.webContents.on('dom-ready', pointerOnNewPage);
+  screen.on('display-metrics-changed', applyDisplayScale);
+  screen.on('display-added', applyDisplayScale);
+  screen.on('display-removed', applyDisplayScale);
 
   // Stay on the kiosk's own server (or our local recovery page). Compare whole
   // origins: a prefix test would let "https://app.example.com.evil.net" through.
@@ -902,21 +1065,91 @@ function createWindow() {
     log(`page: renderer gone (${details.reason}) — reloading in 2s`);
     setTimeout(() => { if (view === 'kiosk') showKiosk(); else if (win && !win.isDestroyed()) win.webContents.reload(); }, 2000);
   });
+  let hangTimer = null;
   win.webContents.on('unresponsive', () => {
     log('page: unresponsive — reloading in 10s unless it recovers');
-    setTimeout(() => { if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.reload(); }, 10000);
+    if (hangTimer) clearTimeout(hangTimer);
+    hangTimer = setTimeout(() => { hangTimer = null; if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.reload(); }, 10000);
   });
-  win.webContents.on('console-message', (_e, level, message) => {
-    // Electron <34: (event, level, message, …); Electron ≥34: (details)
-    if (_e && typeof _e === 'object' && 'message' in _e && level === undefined) { message = _e.message; level = _e.level === 'error' || _e.level === 'warning' ? 2 : 0; }
-    if (level >= 2) log(`page console: ${message}`);
+  win.webContents.on('responsive', () => {
+    if (!hangTimer) return;
+    clearTimeout(hangTimer); hangTimer = null;
+    log('page: responsive again — not reloading');
+  });
+  // Errors and warnings from the page go to the log, with the script's file
+  // name but never its query string (the kiosk page's own address carries the key).
+  win.webContents.on('console-message', (details) => {
+    if (details && typeof details === 'object' && (details.level === 'error' || details.level === 'warning')) {
+      const file = details.sourceId ? String(details.sourceId).split(/[?#]/)[0].split('/').pop() : '';
+      log(`page console: ${details.message}${file ? ` (${file}:${details.lineNumber || '?'})` : ''}`);
+    }
   });
 
   win.on('closed', () => { win = null; });
 }
 
+// CI proof that the app starts on Windows and that the parts no unit test can
+// reach work in a real window: open it, load the settings screen once, check
+// the mouse pointer, the display scale and the corner hold, exit 0. Anything
+// else exits 1. Same checks as Fieldlink-Pi-Kiosk.
+function runSmokeTest() {
+  const timer = setTimeout(() => { console.error('smoke-test: timed out'); app.exit(1); }, 60000);
+  createWindow();
+  // Any error thrown by the page's own script fails the smoke test.
+  const pageErrors = [];
+  win.webContents.on('console-message', (d) => { if (d && d.level === 'error') pageErrors.push(`${d.message} (${String(d.sourceId || '').split('/').pop().split('?')[0]}:${d.lineNumber || '?'})`); });
+  win.webContents.once('did-finish-load', async () => {
+    try {
+      const r = await win.webContents.executeJavaScript('document.getElementById("pair-code") ? "ok" : "missing"');
+      console.log(`smoke-test: settings screen loaded (${r}) — electron ${process.versions.electron}, ${process.platform} ${process.arch}`);
+      if (r !== 'ok') { clearTimeout(timer); return app.exit(1); }
+      const marker = await win.webContents.executeJavaScript('JSON.stringify(window.fieldlinkKioskApp || null)');
+      console.log(`smoke-test: page marker ${marker}`);
+      // Mouse pointer: hidden while nothing moves, shown when a mouse does, hidden again after.
+      const cursorNow = () => win.webContents.executeJavaScript('getComputedStyle(document.getElementById("pair-code")).cursor');
+      const waitCursor = async (want, ms) => { const end = Date.now() + ms; let c; do { c = await cursorNow(); if ((c === 'none') === want) return true; await new Promise(res => setTimeout(res, 100)); } while (Date.now() < end); return false; };
+      const hiddenAtStart = await waitCursor(true, 3000);
+      await win.webContents.executeJavaScript("for (const x of [400, 430]) window.dispatchEvent(new PointerEvent('pointermove', { clientX: x, clientY: 400, screenX: x, screenY: 400, pointerType: 'mouse', bubbles: true }))");
+      const shownOnMove = await waitCursor(false, 3000);
+      await win.webContents.executeJavaScript("window.dispatchEvent(new PointerEvent('pointermove', { clientX: 500, clientY: 500, pointerType: 'touch', bubbles: true }))");
+      const hiddenAgain = await waitCursor(true, POINTER_HIDE_AFTER_MS + 3000);
+      const pointerOk = hiddenAtStart && shownOnMove && hiddenAgain;
+      console.log(`smoke-test: mouse pointer hidden at start ${hiddenAtStart}, shown on movement ${shownOnMove}, hidden again after ${POINTER_HIDE_AFTER_MS / 1000} s ${hiddenAgain} — ${pointerOk ? 'ok' : 'WRONG'}`);
+      if (!pointerOk) { clearTimeout(timer); return app.exit(1); }
+      // Display scale: the page must be as wide, in its own pixels, as the window
+      // divided by the zoom. The zoom lands a moment after it is set, so look a few times.
+      const expected = win.getContentSize()[0] / display.zoom;
+      let inner = 0, scaled = false;
+      for (let i = 0; i < 30 && !scaled; i++) {
+        inner = await win.webContents.executeJavaScript('window.innerWidth');
+        scaled = Math.abs(inner - expected) <= Math.max(2, expected * 0.02);
+        if (!scaled) await new Promise(res => setTimeout(res, 100));
+      }
+      console.log(`smoke-test: screen ${display.width}×${display.height}, Windows scale ${display.windowsScale}×, shown at ${display.scale}× (zoom ${display.zoom}), page ${inner} px wide in a ${win.getContentSize()[0]} px window — ${scaled ? 'ok' : 'WRONG'}`);
+      if (!scaled) { clearTimeout(timer); return app.exit(1); }
+      // The corner-hold gesture, end to end: a synthetic pointer-down in the
+      // corner must reach preload.js and, four seconds later, this process.
+      await win.webContents.executeJavaScript("window.dispatchEvent(new PointerEvent('pointerdown', { clientX: 10, clientY: 10, pointerId: 1, isPrimary: true, bubbles: true }))");
+      const deadline = Date.now() + 6500;
+      while (!smokeGestureSeen && Date.now() < deadline) await new Promise(res => setTimeout(res, 100));
+      clearTimeout(timer);
+      console.log(`smoke-test: corner-hold gesture ${smokeGestureSeen ? 'received' : 'NOT received'}`);
+      if (pageErrors.length) { console.error(`smoke-test: ${pageErrors.length} page error(s):\n  ${pageErrors.join('\n  ')}`); return app.exit(1); }
+      console.log('smoke-test: no page errors');
+      app.exit(smokeGestureSeen ? 0 : 1);
+    } catch (e) { clearTimeout(timer); console.error(`smoke-test: ${e.message}`); app.exit(1); }
+  });
+  win.webContents.once('did-fail-load', (_e, code, desc) => { console.error(`smoke-test: failed to load (${code} ${desc})`); app.exit(1); });
+  view = 'recovery'; recoveryReason = 'no-config';
+  win.loadFile(path.join(__dirname, 'recovery.html'), { query: { reason: 'no-config', smoke: '1' } });
+}
+
 app.whenReady().then(() => {
+  if (SMOKE_TEST) return runSmokeTest();
+
   trimLog();
+  // A display runs for months between restarts: keep the log under its limit meanwhile.
+  setInterval(trimLog, 6 * 60 * 60 * 1000).unref();
   log(`FieldLinkKiosk ${APP_VERSION} starting (electron ${process.versions.electron}, ${os.hostname()})`);
 
   try { powerSaveBlocker.start('prevent-display-sleep'); } catch {}
@@ -931,6 +1164,7 @@ app.whenReady().then(() => {
   globalShortcut.register('CommandOrControl+Shift+K', () => toggleSettingsScreen('Ctrl+Shift+K'));
   globalShortcut.register('CommandOrControl+Shift+R', () => {
     if (kioskUrl) { invalidStreak = 0; showKiosk(); scheduleCheck(5000); }
+    else if (win && !win.isDestroyed()) win.webContents.reload();
   });
   globalShortcut.register('CommandOrControl+Shift+Q', () => {
     globalShortcut.unregisterAll();

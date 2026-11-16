@@ -186,16 +186,32 @@ function Get-DisplayServer {
   if ($c -and $c.kioskUrl) { try { return (Resolve-Server ([Uri]$c.kioskUrl).GetLeftPart([UriPartial]::Authority)) } catch {} }
   return $null
 }
-# Where the updater downloads from: -Server (an administrator ran the helper by
-# hand), else update.json (written by Install-Updater into the admin-only folder),
-# else production. The kiosk-writable config.json is deliberately not consulted:
-# anyone who can re-link the display from its screen could otherwise pick the
+# Where the updater downloads from, in this order:
+#   1. -Server (an administrator ran the helper by hand)
+#   2. a server an administrator pinned (update.json with "pinned", written by
+#      "InstallUpdater -Server ..." into the admin-only folder; an update.json
+#      from before 1.7.0 that names any other server counts as pinned)
+#   3. the server the display is linked to now, when it is one of the two
+#      FieldLink servers. This is what makes a display re-linked to QA take QA
+#      builds and one linked to production only promoted builds.
+#   4. update.json as recorded when kiosk mode was turned on, else production.
+# config.json is writable by the kiosk account, so it is only ever allowed to
+# choose between the two FieldLink servers, never to name another one: anyone
+# who can re-link the display from its screen must not be able to pick the
 # server whose exe the SYSTEM task installs.
 function Get-UpdateServer {
   if ($Server) { return (Resolve-Server $Server) }
   $u = Read-Json $UpdateCfg
-  if ($u -and $u.server) { return (Resolve-Server ([string]$u.server)) }
+  $recorded = $null
+  if ($u -and $u.server) { $recorded = (Resolve-Server ([string]$u.server)) }
+  if ($recorded -and ($u.pinned -or ($TrustedUpdateServers -notcontains $recorded.ToLowerInvariant()))) { return $recorded }
+  $d = Get-DisplayServer
+  if ($d -and ($TrustedUpdateServers -contains $d.ToLowerInvariant())) { return $d.ToLowerInvariant() }
+  if ($recorded) { return $recorded }
   return $DefaultUpdateServer
+}
+function Get-UptimeMinutes {
+  try { return [int]((Get-Date) - (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime).TotalMinutes } catch { return $null }
 }
 # What Install-Updater records in update.json: -Server, else the display's
 # server when it is one of the FieldLink servers (so a QA display updates from
@@ -451,7 +467,8 @@ function Install-Updater([string]$serverOrigin) {
   Copy-Item -Path $PSCommandPath -Destination $ScriptCopy -Force
   if (-not $serverOrigin) { $serverOrigin = $DefaultUpdateServer }
   if ($serverOrigin -notmatch '^https://') { Fail "Updates are only fetched over https ($serverOrigin)" }
-  [ordered]@{ server = $serverOrigin; savedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -Path $UpdateCfg -Encoding UTF8
+  # "pinned" only when an administrator named the server; otherwise the updater follows the display (Get-UpdateServer).
+  [ordered]@{ server = $serverOrigin; pinned = [bool]$Server; savedAt = (Get-Date).ToString('o') } | ConvertTo-Json | Set-Content -Path $UpdateCfg -Encoding UTF8
   $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $arg = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptCopy`" -Action Update"
   $action   = New-ScheduledTaskAction -Execute $ps -Argument $arg
@@ -571,7 +588,10 @@ switch ($Action) {
   'Update' {
     Require-Admin
     $startedAt = (Get-Date).ToString('o')
-    $status = [ordered]@{ checkedAt = $startedAt; installed = $null; latest = $null; result = 'none'; error = $null; server = $null }
+    $status = [ordered]@{ checkedAt = $startedAt; installed = $null; latest = $null; result = 'none'; error = $null; server = $null; failedVersion = $null; restartedAt = $null }
+    $previous = Read-Json $UpdateLog     # the run before this one, read before it is overwritten
+    $appStopped = $false                 # true once the running app has been closed for the install
+    $latest = $null
     try {
       $exe = Find-Exe
       $installed = Get-ExeVersion $exe
@@ -591,6 +611,18 @@ switch ($Action) {
         $status.result = 'up-to-date'; Write-UpdateStatus $status; Write-Log "Up to date ($installed)"
         Write-Result -Ok $true -Message "Up to date (FieldLinkKiosk $installed)." -Extra $status
         exit 0
+      }
+      # The scheduled run right after a restart that a failed install caused must
+      # not fail the same way and restart again: that version waits for tonight.
+      if (-not $Force -and -not $Relaunch -and $previous -and $previous.result -eq 'failed' -and $previous.restartedAt -and ([string]$previous.failedVersion -eq $latest)) {
+        $up = Get-UptimeMinutes
+        if ($up -eq $null -or $up -lt 15) {
+          $status.result = 'failed'; $status.error = [string]$previous.error; $status.failedVersion = $latest
+          Write-UpdateStatus $status
+          Write-Log "Installing $latest failed before this restart ($($previous.error)); not trying again until the next scheduled run" 'warn'
+          Write-Result -Ok $false -Message "Installing FieldLinkKiosk $latest failed earlier ($($previous.error)). It will be tried again tonight." -Extra $status
+          exit 0
+        }
       }
       $dlDir = Join-Path $AdminDir 'updates'
       New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
@@ -616,6 +648,7 @@ switch ($Action) {
       $wasRunning = [bool](Get-Process -Name 'FieldLinkKiosk' -ErrorAction SilentlyContinue)
       Write-Result -Ok $true -Message "Installing FieldLinkKiosk $latest..." -Running $true
       Get-Process -Name 'FieldLinkKiosk' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+      $appStopped = $wasRunning
       Start-Sleep -Seconds 2
       $p = Start-Process -FilePath $file -ArgumentList '/S' -Wait -PassThru
       if ($p.ExitCode -ne 0) { throw "Installer exited with code $($p.ExitCode)." }
@@ -654,9 +687,28 @@ switch ($Action) {
       }
       $msg = ($msg -replace '\s+', ' ').Trim()
       if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 300) + '...' }
-      $status.result = 'failed'; $status.error = $msg
-      Write-UpdateStatus $status
+      $status.result = 'failed'; $status.error = $msg; $status.failedVersion = $latest
       Write-Log "Update failed: $msg" 'error'
+      # The app had already been closed for the install. In the kiosk account it
+      # is the shell, so nothing would bring it back and the screen would stay
+      # black: start it again, or restart the PC when there is no desktop to
+      # start it from (the scheduled task runs as SYSTEM).
+      if ($appStopped) {
+        try {
+          if ($Relaunch) {
+            $back = Find-Exe
+            if ($back) { Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList "`"$back`""; Write-Log 'Started the app again after the failed install' }
+          } else {
+            $status.restartedAt = (Get-Date).ToString('o')
+            Write-UpdateStatus $status
+            Write-Log 'Restarting the PC to bring the display back after the failed install' 'warn'
+            Write-Result -Ok $false -Message "Update failed: $msg - restarting to bring the display back." -NeedsRestart $true -Extra $status
+            Run-Native { shutdown.exe /r /t 20 /c "FieldLink Kiosk: the update failed, restarting the display" /d p:4:2 } | Out-Null
+            exit 1
+          }
+        } catch { Write-Log "Could not bring the app back: $_" 'error' }
+      }
+      Write-UpdateStatus $status
       Write-Result -Ok $false -Message "Update failed: $msg" -Extra $status
       exit 1
     }

@@ -1,20 +1,23 @@
 {
   "name": "fieldlink-kiosk",
-  "version": "1.6.1",
+  "version": "1.7.0",
   "description": "Field Link Missions Kiosk Display",
   "author": "Field Link Missions",
   "homepage": "https://fieldlinkmissions.com",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Whitened-Fields-Ministries/fieldlink-kiosk.git"
+    "url": "https://github.com/Whitened-Fields-Ministries/Fieldlink-Win-Kiosk.git"
   },
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "check": "node --check main.js && node --check preload.js && node --check display-scale.js && node scripts/check-recovery-html.js",
+    "test": "node --test test/*.test.js",
+    "smoke": "electron . --smoke-test",
     "build": "electron-builder --win --x64"
   },
   "devDependencies": {
-    "electron": "44.7.2",
+    "electron": "45.3.1",
     "electron-builder": "26.15.3"
   },
   "build": {
@@ -48,6 +51,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "display-scale.js",
       "recovery.html"
     ],
     "asar": true,
